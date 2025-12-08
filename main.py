@@ -15,8 +15,9 @@ from pydantic import BaseModel
 import uvicorn
 
 # import shared helpers and router
-from fastapi_server import helpers
-from fastapi_server.audio_api import router as audio_router
+# Local imports so `uvicorn main:app` works on deploy
+import helpers
+from audio_api import router as audio_router
 
 # --- FastAPI app setup ---
 app = FastAPI(
@@ -336,4 +337,4 @@ async def analyze_mouth(payload: MouthPayload, request: Request):
 
 
 if __name__ == "__main__":
-    uvicorn.run("fastapi_server.main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
