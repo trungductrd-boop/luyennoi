@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Vietnamese Pronunciation Learning</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 50px auto;
+            padding: 20px;
+        }
+        .lesson {
+            border: 1px solid #ddd;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 5px;
+        }
+        audio {
+            width: 100%;
+            margin-top: 10px;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎤 Vietnamese Pronunciation Learning</h1>
+    <p>API Documentation: <a href="/docs">/docs</a></p>
+    
+    <div id="lessons"></div>
+
+    <script>
+        // Fetch lessons from API
+        fetch('/api/lessons')
+            .then(response => response.json())
+            .then(lessons => {
+                const container = document.getElementById('lessons');
+                lessons.forEach(lesson => {
+                    const div = document.createElement('div');
+                    div.className = 'lesson';
+                    div.innerHTML = `
+                        <h2>${lesson.title}</h2>
+                        <p>${lesson.description}</p>
+                        <p>Progress: ${lesson.progress}%</p>
+                    `;
+                    container.appendChild(div);
+                });
+            })
+            .catch(error => console.error('Error:', error));
+    </script>
+</body>
+</html>

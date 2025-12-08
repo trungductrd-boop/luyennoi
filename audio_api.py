@@ -1,0 +1,903 @@
+from fastapi import APIRouter, File, UploadFile, Form, HTTPException, Request
+from fastapi.responses import StreamingResponse, FileResponse, Response, JSONResponse
+from typing import Optional
+from pathlib import Path
+import os
+import uuid
+import zipfile
+import shutil
+import mimetypes
+import re
+
+from . import helpers
+from pydantic import BaseModel, field_validator
+
+router = APIRouter()
+
+# Constants for streaming
+CHUNK_SIZE = 1024 * 1024  # 1MB
+
+class VocabItemIn(BaseModel):
+	id: Optional[str] = None
+	word: str
+	meaning: Optional[str] = ""
+	example: Optional[str] = ""
+	audio_filename: Optional[str] = None
+	sample_id: Optional[str] = None
+	
+	@field_validator('word')
+	@classmethod
+	def word_not_empty(cls, v):
+		if not v or not v.strip():
+			raise ValueError('Word cannot be empty')
+		return v.strip()
+
+# Helper functions for audio streaming
+def get_mime_type(path: Path) -> str:
+	"""Get MIME type for file"""
+	mt, _ = mimetypes.guess_type(str(path))
+	return mt or "application/octet-stream"
+
+def safe_resolve_filename(filename: str) -> Path:
+	"""Safely resolve filename and prevent path traversal"""
+	if "/" in filename or "\\" in filename or ".." in filename:
+		raise HTTPException(status_code=400, detail="Invalid filename")
+	
+	file_path = (Path(helpers.SAMPLES_DIR) / filename).resolve()
+	samples_dir = Path(helpers.SAMPLES_DIR).resolve()
+	
+	if not str(file_path).startswith(str(samples_dir)):
+		raise HTTPException(status_code=400, detail="Invalid file path")
+	
+	return file_path
+
+# -------------------------
+# API: lessons & vocab
+# -------------------------
+@router.get("/lessons")
+def api_get_lessons():
+	return helpers.LESSONS
+
+@router.get("/lessons/{lesson_id}/vocab")
+def api_get_vocab(lesson_id: str):
+	return helpers.merged_vocab_for_lesson(lesson_id)
+
+@router.put("/lessons/{lesson_id}/progress")
+def api_update_progress(lesson_id: str, progress: int):
+	# Persist progress to JSON instead of memory
+	helpers.load_persisted_store()
+	helpers.PERSISTED_STORE.setdefault("progress", {})
+	helpers.PERSISTED_STORE["progress"][lesson_id] = max(0, min(100, int(progress)))
+	helpers.save_persisted_store()
+	
+	# Also update in-memory for compatibility
+	for l in helpers.LESSONS:
+		if l["id"] == lesson_id:
+			l["progress"] = helpers.PERSISTED_STORE["progress"][lesson_id]
+			return {"ok": True, "lesson": l}
+	raise HTTPException(status_code=404, detail="Lesson not found")
+
+# -------------------------
+# API: samples listing, upload, rescan
+# -------------------------
+@router.get("/samples", summary="List sample files available on server (auto-rescan is triggered)")
+def api_list_samples():
+	# ensure samples dir exists
+	os.makedirs(helpers.SAMPLES_DIR, exist_ok=True)
+	report = helpers.rescan_samples()
+	files = []
+	for fn in sorted(os.listdir(helpers.SAMPLES_DIR)):
+		path = os.path.join(helpers.SAMPLES_DIR, fn)
+		if os.path.isfile(path):
+			files.append({"filename": fn, "audio_url": f"/static/samples/{fn}"})
+	return {"count": len(files), "files": files, "rescan_report": report}
+
+@router.post("/samples/upload-simple", summary="Upload sample and register (simple). Returns sample_id and audio_url.")
+async def api_upload_simple(file: UploadFile = File(...), lesson_id: Optional[str] = Form(None), vocab_id: Optional[str] = Form(None)):
+	contents = await file.read()
+	if len(contents) == 0:
+		raise HTTPException(status_code=400, detail="Empty file")
+	if len(contents) > helpers.MAX_UPLOAD_BYTES:
+		raise HTTPException(status_code=413, detail="File too large")
+	_, ext = os.path.splitext(file.filename)
+	ext = ext or ".wav"
+	sample_id = str(uuid.uuid4())[:8]
+	raw_fname = f"{sample_id}{ext}"
+	# ensure samples dir exists before writing
+	os.makedirs(helpers.SAMPLES_DIR, exist_ok=True)
+	raw_path = os.path.join(helpers.SAMPLES_DIR, raw_fname)
+	with open(raw_path, "wb") as f:
+		f.write(contents)
+
+	conv_fname = f"{sample_id}.wav"
+	conv_path = os.path.join(helpers.SAMPLES_DIR, conv_fname)
+	try:
+		helpers.convert_to_wav16_mono(raw_path, conv_path)
+		if raw_path != conv_path:
+			try:
+				os.remove(raw_path)
+			except Exception:
+				pass
+	except Exception:
+		conv_fname = raw_fname
+		conv_path = raw_path
+
+	helpers.load_persisted_store()
+	helpers.PERSISTED_STORE.setdefault("samples", {})
+	helpers.PERSISTED_STORE["samples"][sample_id] = {"filename": conv_fname, "lesson_id": lesson_id, "vocab_id": vocab_id}
+	helpers.save_persisted_store()
+	audio_url = f"/static/samples/{conv_fname}"
+	return {"ok": True, "sample_id": sample_id, "audio_filename": conv_fname, "audio_url": audio_url}
+
+@router.post("/samples/rescan", summary="Rescan samples directory and auto-register new files")
+def api_samples_rescan():
+	report = helpers.rescan_samples()
+	return {"ok": True, "report": report}
+
+@router.get("/samples/export-package", summary="Export samples + vocab_store.json as a zip for offline use")
+def api_export_package():
+	package_name = f"speech_package_{uuid.uuid4().hex[:8]}.zip"
+	# ensure tmp dir exists
+	os.makedirs(helpers.TMP_DIR, exist_ok=True)
+	package_path = os.path.join(helpers.TMP_DIR, package_name)
+	with zipfile.ZipFile(package_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+		if os.path.exists(helpers.VOCAB_STORE_FILE):
+			z.write(helpers.VOCAB_STORE_FILE, arcname=os.path.basename(helpers.VOCAB_STORE_FILE))
+		if os.path.isdir(helpers.SAMPLES_DIR):
+			for f in os.listdir(helpers.SAMPLES_DIR):
+				full = os.path.join(helpers.SAMPLES_DIR, f)
+				if os.path.isfile(full):
+					z.write(full, arcname=os.path.join("samples", f))
+	def iterfile():
+		# stream in fixed-size chunks to avoid line-based iteration issues
+		try:
+			with open(package_path, "rb") as fp:
+				while True:
+					chunk = fp.read(8192)
+					if not chunk:
+						break
+					yield chunk
+		finally:
+			try:
+				os.remove(package_path)
+			except Exception:
+				pass
+	# use proper Content-Disposition header
+	headers = {"Content-Disposition": f'attachment; filename="{package_name}"'}
+	return StreamingResponse(iterfile(), media_type="application/zip", headers=headers)
+
+@router.post("/samples/import-package", summary="Import zip (samples + vocab_store.json). Overwrites persisted store and copies samples.")
+async def api_import_package(file: UploadFile = File(...)):
+	contents = await file.read()
+	if not contents:
+		raise HTTPException(status_code=400, detail="Empty upload")
+	# ensure tmp dir exists
+	os.makedirs(helpers.TMP_DIR, exist_ok=True)
+	temp_zip = os.path.join(helpers.TMP_DIR, f"import_{uuid.uuid4().hex[:8]}.zip")
+	with open(temp_zip, "wb") as f:
+		f.write(contents)
+	extract_dir = os.path.join(helpers.TMP_DIR, f"extract_{uuid.uuid4().hex[:8]}")
+	os.makedirs(extract_dir, exist_ok=True)
+	try:
+		with zipfile.ZipFile(temp_zip, 'r') as z:
+			z.extractall(extract_dir)
+		maybe_vocab = os.path.join(extract_dir, os.path.basename(helpers.VOCAB_STORE_FILE))
+		if os.path.exists(maybe_vocab):
+			shutil.copy2(maybe_vocab, helpers.VOCAB_STORE_FILE)
+		extracted_samples_dir = os.path.join(extract_dir, "samples")
+		if os.path.isdir(extracted_samples_dir):
+			# ensure samples dir exists before copying
+			os.makedirs(helpers.SAMPLES_DIR, exist_ok=True)
+			for f in os.listdir(extracted_samples_dir):
+				src = os.path.join(extracted_samples_dir, f)
+				dst = os.path.join(helpers.SAMPLES_DIR, f)
+				shutil.copy2(src, dst)
+		try:
+			os.remove(temp_zip)
+		except Exception:
+			pass
+		report = helpers.rescan_samples()
+		return {"ok": True, "report": report}
+	except zipfile.BadZipFile:
+		raise HTTPException(status_code=400, detail="Invalid zip file")
+	finally:
+		try:
+			shutil.rmtree(extract_dir)
+		except Exception:
+			pass
+
+# -------------------------
+# Persisted vocab management
+# -------------------------
+@router.post("/lessons/{lesson_id}/vocab", summary="Add a vocab item to persisted store and link to a sample")
+def api_add_vocab(lesson_id: str, item: VocabItemIn):
+	helpers.load_persisted_store()
+	lessons_store = helpers.PERSISTED_STORE.setdefault("lessons", {})
+	if lesson_id not in lessons_store:
+		lessons_store[lesson_id] = []
+	audio_filename = item.audio_filename
+	if item.sample_id:
+		sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(item.sample_id)
+		if not sample_meta:
+			raise HTTPException(status_code=404, detail="sample_id not found")
+		audio_filename = sample_meta.get("filename")
+	vid = item.id or f"{lesson_id}_{len(lessons_store[lesson_id]) + 1}"
+	vocab_obj = {
+		"id": vid,
+		"word": item.word,
+		"meaning": item.meaning or "",
+		"example": item.example or "",
+		"audio_filename": audio_filename
+	}
+	lessons_store[lesson_id].append(vocab_obj)
+	helpers.save_persisted_store()
+	vocab_with_url = {**vocab_obj, "audio_url": f"/static/samples/{audio_filename}" if audio_filename else None}
+	return {"ok": True, "vocab": vocab_with_url}
+
+@router.get("/lessons/{lesson_id}/vocab/store", summary="Get persisted vocab for lesson")
+def api_get_vocab_store(lesson_id: str):
+	helpers.load_persisted_store()
+	lessons_store = helpers.PERSISTED_STORE.get("lessons", {})
+	items = lessons_store.get(lesson_id, [])
+	result = []
+	for v in items:
+		fn = v.get("audio_filename")
+		result.append({**v, "audio_url": f"/static/samples/{fn}" if fn else None})
+	return {"count": len(result), "vocab": result}
+
+# -------------------------
+# API: Pronunciation Analysis
+# -------------------------
+@router.post("/analyze/compare", summary="Compare user audio with reference sample")
+async def api_analyze_compare(
+	user_audio: UploadFile = File(..., description="User's pronunciation audio"),
+	sample_id: str = Form(..., description="Reference sample ID to compare against")
+):
+	"""
+	Upload user audio and compare with a reference sample.
+	Returns similarity scores for pronunciation accuracy.
+	"""
+	# Validate user audio
+	user_contents = await user_audio.read()
+	if len(user_contents) == 0:
+		raise HTTPException(status_code=400, detail="Empty audio file")
+	if len(user_contents) > helpers.MAX_UPLOAD_BYTES:
+		raise HTTPException(status_code=413, detail="File too large")
+	
+	# Get reference sample info
+	helpers.load_persisted_store()
+	sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
+	if not sample_meta:
+		raise HTTPException(status_code=404, detail=f"Reference sample '{sample_id}' not found")
+	
+	ref_filename = sample_meta.get("filename")
+	ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
+	if not os.path.exists(ref_path):
+		raise HTTPException(status_code=404, detail=f"Reference audio file not found: {ref_filename}")
+	
+	# Save user audio temporarily
+	os.makedirs(helpers.TMP_DIR, exist_ok=True)
+	user_id = str(uuid.uuid4())[:8]
+	_, ext = os.path.splitext(user_audio.filename)
+	user_raw_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}{ext or '.wav'}")
+	with open(user_raw_path, "wb") as f:
+		f.write(user_contents)
+	
+	# Convert user audio to WAV 16kHz mono
+	user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
+	try:
+		helpers.convert_to_wav16_mono(user_raw_path, user_wav_path)
+		if user_raw_path != user_wav_path:
+			try:
+				os.remove(user_raw_path)
+			except Exception:
+				pass
+	except Exception as e:
+		helpers.logger.error(f"Audio conversion failed: {e}")
+		try:
+			os.remove(user_raw_path)
+		except Exception:
+			pass
+		raise HTTPException(status_code=500, detail=f"Audio conversion failed: {str(e)}")
+	
+	# Extract features from both audios
+	try:
+		user_features = helpers.extract_features(user_wav_path)
+		ref_features = helpers.extract_features(ref_path)
+	except Exception as e:
+		helpers.logger.error(f"Feature extraction failed: {e}")
+		try:
+			os.remove(user_wav_path)
+		except Exception:
+			pass
+		raise HTTPException(status_code=500, detail=f"Feature extraction failed: {str(e)}")
+	
+	# Compare features
+	try:
+		mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
+	except Exception as e:
+		helpers.logger.error(f"Comparison failed: {e}")
+		try:
+			os.remove(user_wav_path)
+		except Exception:
+			pass
+		raise HTTPException(status_code=500, detail=f"Comparison failed: {str(e)}")
+	
+	# Calculate similarity score (0-100)
+	# Lower distance = higher similarity
+	mfcc_score = max(0, 100 - mfcc_dist * 2)  # Adjust multiplier as needed
+	pitch_score = max(0, 100 - pitch_diff * 0.5)
+	tempo_score = max(0, 100 - tempo_diff * 0.5)
+	overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
+	
+	# Cleanup user audio
+	try:
+		os.remove(user_wav_path)
+	except Exception:
+		pass
+	
+	return {
+		"ok": True,
+		"sample_id": sample_id,
+		"reference_file": ref_filename,
+		"scores": {
+			"overall": round(overall_score, 2),
+			"mfcc": round(mfcc_score, 2),
+			"pitch": round(pitch_score, 2),
+			"tempo": round(tempo_score, 2)
+		},
+		"details": {
+			"mfcc_distance": round(mfcc_dist, 4),
+			"pitch_difference_hz": round(pitch_diff, 2),
+			"tempo_difference_bpm": round(tempo_diff, 2)
+		},
+		"feedback": _get_feedback(overall_score)
+	}
+
+def _get_feedback(score: float) -> str:
+	"""Generate feedback message based on score"""
+	if score >= 90:
+		return "Xuất sắc! Phát âm rất chuẩn."
+	elif score >= 75:
+		return "Tốt! Phát âm khá chính xác."
+	elif score >= 60:
+		return "Khá! Cần luyện tập thêm một chút."
+	elif score >= 40:
+		return "Cần cải thiện. Hãy nghe kỹ mẫu và thử lại."
+	else:
+		return "Cần luyện tập nhiều hơn. Nghe lại mẫu và phát âm chậm rãi."
+
+@router.post("/analyze/auto", summary="Auto-detect and analyze user pronunciation")
+async def api_analyze_auto(
+	user_audio: UploadFile = File(..., description="User's pronunciation audio"),
+	lesson_id: Optional[str] = Form(None, description="Optional: filter by lesson ID")
+):
+	"""
+	Upload audio and automatically detect which word the user is pronouncing.
+	Compares with ALL samples and returns best match with similarity score.
+	"""
+	# Validate user audio
+	user_contents = await user_audio.read()
+	if len(user_contents) == 0:
+		raise HTTPException(status_code=400, detail="Empty audio file")
+	if len(user_contents) > helpers.MAX_UPLOAD_BYTES:
+		raise HTTPException(status_code=413, detail="File too large")
+	
+	# Save user audio temporarily
+	os.makedirs(helpers.TMP_DIR, exist_ok=True)
+	user_id = str(uuid.uuid4())[:8]
+	_, ext = os.path.splitext(user_audio.filename or "audio.wav")
+	user_raw_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}{ext or '.wav'}")
+	with open(user_raw_path, "wb") as f:
+		f.write(user_contents)
+	
+	# Convert user audio to WAV 16kHz mono
+	user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
+	try:
+		helpers.convert_to_wav16_mono(user_raw_path, user_wav_path)
+		if user_raw_path != user_wav_path:
+			try:
+				os.remove(user_raw_path)
+			except Exception:
+				pass
+	except Exception as e:
+		helpers.logger.error(f"Audio conversion failed: {e}")
+		try:
+			os.remove(user_raw_path)
+		except Exception:
+			pass
+		raise HTTPException(status_code=500, detail=f"Audio conversion failed: {str(e)}")
+	
+	# Extract user features
+	try:
+		user_features = helpers.extract_features(user_wav_path)
+	except Exception as e:
+		helpers.logger.error(f"Feature extraction failed: {e}")
+		try:
+			os.remove(user_wav_path)
+		except Exception:
+			pass
+		raise HTTPException(status_code=500, detail=f"Feature extraction failed: {str(e)}")
+	
+	# Load all samples and compare
+	helpers.load_persisted_store()
+	samples_meta = helpers.PERSISTED_STORE.get("samples", {})
+	
+	if not samples_meta:
+		try:
+			os.remove(user_wav_path)
+		except Exception:
+			pass
+		raise HTTPException(status_code=404, detail="No reference samples found. Please upload sample audios first.")
+	
+	# Compare with all samples
+	matches = []
+	for sample_id, meta in samples_meta.items():
+		# Filter by lesson_id if provided
+		if lesson_id and meta.get("lesson_id") != lesson_id:
+			continue
+		
+		ref_filename = meta.get("filename")
+		ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
+		
+		if not os.path.exists(ref_path):
+			continue
+		
+		try:
+			# Extract reference features
+			ref_features = helpers.extract_features(ref_path)
+			
+			# Compare
+			mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
+			
+			# Calculate scores
+			mfcc_score = max(0, 100 - mfcc_dist * 2)
+			pitch_score = max(0, 100 - pitch_diff * 0.5)
+			tempo_score = max(0, 100 - tempo_diff * 0.5)
+			overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
+			
+			# Get vocab info
+			vocab_info = _get_vocab_info(sample_id, meta)
+			
+			matches.append({
+				"sample_id": sample_id,
+				"filename": ref_filename,
+				"lesson_id": meta.get("lesson_id"),
+				"vocab_id": meta.get("vocab_id"),
+				"word": vocab_info.get("word", "Unknown"),
+				"meaning": vocab_info.get("meaning", ""),
+				"overall_score": round(overall_score, 2),
+				"scores": {
+					"mfcc": round(mfcc_score, 2),
+					"pitch": round(pitch_score, 2),
+					"tempo": round(tempo_score, 2)
+				},
+				"details": {
+					"mfcc_distance": round(mfcc_dist, 4),
+					"pitch_difference_hz": round(pitch_diff, 2),
+					"tempo_difference_bpm": round(tempo_diff, 2)
+				}
+			})
+		except Exception as e:
+			helpers.logger.warning(f"Skipped sample {sample_id}: {e}")
+			continue
+	
+	# Cleanup user audio
+	try:
+		os.remove(user_wav_path)
+	except Exception:
+		pass
+	
+	if not matches:
+		raise HTTPException(status_code=404, detail="No matching samples found")
+	
+	# Sort by overall_score descending
+	matches.sort(key=lambda x: x["overall_score"], reverse=True)
+	best_match = matches[0]
+	
+	return {
+		"ok": True,
+		"detected_word": best_match["word"],
+		"best_match": best_match,
+		"all_matches": matches[:5],  # Top 5 matches
+		"total_compared": len(matches),
+		"feedback": _get_feedback(best_match["overall_score"])
+	}
+
+def _get_vocab_info(sample_id: str, meta: dict) -> dict:
+	"""Get vocabulary information for a sample"""
+	vocab_id = meta.get("vocab_id")
+	lesson_id = meta.get("lesson_id")
+	
+	# Try to find in persisted lessons
+	if lesson_id and vocab_id:
+		lessons_store = helpers.PERSISTED_STORE.get("lessons", {})
+		if lesson_id in lessons_store:
+			for vocab in lessons_store[lesson_id]:
+				if vocab.get("id") == vocab_id:
+					return vocab
+	
+	# Try to find in built-in VOCAB
+	if lesson_id and lesson_id in helpers.VOCAB:
+		for vocab in helpers.VOCAB[lesson_id]:
+			if vocab.get("id") == vocab_id:
+				return vocab
+	
+	# Fallback: try to extract from filename
+	filename = meta.get("filename", "")
+	m = re.match(r'^\d+[-_](.+)\.wav$', filename)
+	if m:
+		word_part = m.group(1)
+		word = re.sub(r'[_\-]+', ' ', word_part).strip().capitalize()
+		return {"word": word, "meaning": ""}
+	
+	return {"word": meta.get("original_name", filename), "meaning": ""}
+
+# -------------------------
+# API: Secure audio streaming with Range support
+# -------------------------
+@router.get("/audio/list", summary="List all available audio files")
+def api_list_audio():
+	"""
+	Get list of all audio files in samples directory.
+	Returns filename, size, and MIME type for each file.
+	"""
+	files = []
+	samples_path = Path(helpers.SAMPLES_DIR)
+	
+	if not samples_path.exists():
+		return {"files": [], "count": 0}
+	
+	for p in samples_path.iterdir():
+		if p.is_file():
+			_, ext = os.path.splitext(p.name)
+			if ext.lower() in helpers.ALLOWED_EXTS:
+				files.append({
+					"name": p.name,
+					"size": p.stat().st_size,
+					"mime": get_mime_type(p),
+					"stream_url": f"/api/audio/stream/{p.name}",
+					"download_url": f"/api/audio/download/{p.name}"
+				})
+	
+	return {"files": files, "count": len(files)}
+
+@router.get("/audio/stream/{filename}", summary="Stream audio file with Range support")
+async def api_stream_audio(request: Request, filename: str):
+	"""
+	Stream audio file with full Range request support for seeking.
+	Supports ETag caching and partial content (206).
+	"""
+	file_path = safe_resolve_filename(filename)
+	
+	if not file_path.exists() or not file_path.is_file():
+		raise HTTPException(status_code=404, detail="File not found")
+	
+	# Validate file type
+	_, ext = os.path.splitext(filename)
+	if ext.lower() not in helpers.ALLOWED_EXTS:
+		raise HTTPException(status_code=400, detail="File type not allowed")
+	
+	file_size = file_path.stat().st_size
+	content_type = get_mime_type(file_path)
+	
+	# Generate ETag
+	etag = f'W/"{file_path.stat().st_mtime_ns:x}-{file_path.stat().st_size:x}"'
+	
+	# Check If-None-Match for 304
+	if_none_match = request.headers.get("if-none-match")
+	if if_none_match and if_none_match == etag:
+		return JSONResponse(status_code=304, content=None)
+	
+	range_header = request.headers.get("range")
+	
+	# No Range header → return full file
+	if not range_header:
+		headers = {
+			"ETag": etag,
+			"Accept-Ranges": "bytes",
+			"Content-Length": str(file_size),
+			"Cache-Control": "public, max-age=3600",
+			"Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, ETag"
+		}
+		return FileResponse(
+			path=str(file_path),
+			media_type=content_type,
+			filename=file_path.name,
+			headers=headers
+		)
+	
+	# Parse Range header
+	try:
+		range_value = range_header.strip().lower()
+		assert range_value.startswith("bytes=")
+		r = range_value.split("=", 1)[1]
+		start_s, end_s = r.split("-", 1)
+		start = int(start_s) if start_s else 0
+		end = int(end_s) if end_s else file_size - 1
+	except Exception as e:
+		helpers.logger.warning(f"Invalid Range header: {range_header}, error: {e}")
+		headers = {
+			"ETag": etag,
+			"Accept-Ranges": "bytes",
+			"Content-Length": str(file_size)
+		}
+		return FileResponse(
+			path=str(file_path),
+			media_type=content_type,
+			filename=file_path.name,
+			headers=headers
+		)
+	
+	# Validate range
+	if start >= file_size:
+		raise HTTPException(
+			status_code=416,
+			detail="Requested Range Not Satisfiable",
+			headers={"Content-Range": f"bytes */{file_size}"}
+		)
+	
+	end = min(end, file_size - 1)
+	length = end - start + 1
+	
+	# Stream generator
+	def iter_file(path: Path, start_pos: int, content_length: int):
+		with open(path, "rb") as f:
+			f.seek(start_pos)
+			remaining = content_length
+			while remaining > 0:
+				chunk_size = min(CHUNK_SIZE, remaining)
+				chunk = f.read(chunk_size)
+				if not chunk:
+					break
+				remaining -= len(chunk)
+				yield chunk
+	
+	headers = {
+		"Content-Range": f"bytes {start}-{end}/{file_size}",
+		"Accept-Ranges": "bytes",
+		"Content-Length": str(length),
+		"ETag": etag,
+		"Cache-Control": "public, max-age=3600",
+		"Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length, ETag"
+	}
+	
+	return StreamingResponse(
+		iter_file(file_path, start, length),
+		status_code=206,
+		media_type=content_type,
+		headers=headers
+	)
+
+@router.head("/audio/stream/{filename}", summary="Get audio metadata (HEAD)")
+async def api_stream_audio_head(filename: str):
+	"""HEAD request for audio metadata without downloading."""
+	file_path = safe_resolve_filename(filename)
+	
+	if not file_path.exists() or not file_path.is_file():
+		raise HTTPException(status_code=404, detail="File not found")
+	
+	_, ext = os.path.splitext(filename)
+	if ext.lower() not in helpers.ALLOWED_EXTS:
+		raise HTTPException(status_code=400, detail="File type not allowed")
+	
+	file_size = file_path.stat().st_size
+	content_type = get_mime_type(file_path)
+	etag = f'W/"{file_path.stat().st_mtime_ns:x}-{file_path.stat().st_size:x}"'
+	
+	headers = {
+		"Content-Type": content_type,
+		"Content-Length": str(file_size),
+		"Accept-Ranges": "bytes",
+		"ETag": etag,
+		"Cache-Control": "public, max-age=3600"
+	}
+	
+	return Response(status_code=200, headers=headers)
+
+@router.get("/audio/download/{filename}", summary="Download audio file (force download)")
+async def api_download_audio(filename: str):
+	"""Force download (triggers browser download dialog)."""
+	file_path = safe_resolve_filename(filename)
+	
+	if not file_path.exists() or not file_path.is_file():
+		raise HTTPException(status_code=404, detail="File not found")
+	
+	_, ext = os.path.splitext(filename)
+	if ext.lower() not in helpers.ALLOWED_EXTS:
+		raise HTTPException(status_code=400, detail="File type not allowed")
+	
+	content_type = get_mime_type(file_path)
+	
+	return FileResponse(
+		path=str(file_path),
+		media_type=content_type,
+		filename=filename,
+		headers={
+			"Content-Disposition": f'attachment; filename="{filename}"',
+			"Cache-Control": "public, max-age=3600"
+		}
+	)
+
+# -------------------------
+# API: Data sync for mobile app
+# -------------------------
+@router.get("/sync/lessons", summary="Get all lessons with vocab for offline sync")
+def api_sync_lessons():
+	"""Get complete lesson data with audio URLs for mobile app sync."""
+	helpers.load_persisted_store()
+	
+	lessons_data = []
+	for lesson in helpers.LESSONS:
+		lesson_id = lesson["id"]
+		vocab_list = helpers.merged_vocab_for_lesson(lesson_id)
+		
+		# Update URLs to use streaming endpoint
+		for vocab in vocab_list:
+			if vocab.get("audio_filename"):
+				vocab["audio_url"] = f"/api/audio/stream/{vocab['audio_filename']}"
+				vocab["download_url"] = f"/api/audio/download/{vocab['audio_filename']}"
+		
+		progress = helpers.PERSISTED_STORE.get("progress", {}).get(lesson_id, lesson.get("progress", 0))
+		
+		lessons_data.append({
+			"id": lesson["id"],
+			"title": lesson["title"],
+			"description": lesson["description"],
+			"progress": progress,
+			"vocab_count": len(vocab_list),
+			"vocab": vocab_list
+		})
+	
+	return {
+		"ok": True,
+		"total_lessons": len(lessons_data),
+		"lessons": lessons_data,
+		"sync_timestamp": helpers._get_timestamp()
+	}
+
+@router.get("/sync/lesson/{lesson_id}", summary="Get single lesson data")
+def api_sync_single_lesson(lesson_id: str):
+	"""Get complete data for a single lesson."""
+	lesson = None
+	for l in helpers.LESSONS:
+		if l["id"] == lesson_id:
+			lesson = l
+			break
+	
+	if not lesson:
+		raise HTTPException(status_code=404, detail="Lesson not found")
+	
+	helpers.load_persisted_store()
+	vocab_list = helpers.merged_vocab_for_lesson(lesson_id)
+	
+	# Update URLs
+	for vocab in vocab_list:
+		if vocab.get("audio_filename"):
+			vocab["audio_url"] = f"/api/audio/stream/{vocab['audio_filename']}"
+			vocab["download_url"] = f"/api/audio/download/{vocab['audio_filename']}"
+	
+	progress = helpers.PERSISTED_STORE.get("progress", {}).get(lesson_id, lesson.get("progress", 0))
+	
+	return {
+		"ok": True,
+		"lesson": {
+			"id": lesson["id"],
+			"title": lesson["title"],
+			"description": lesson["description"],
+			"progress": progress,
+			"vocab_count": len(vocab_list),
+			"vocab": vocab_list
+		},
+		"sync_timestamp": helpers._get_timestamp()
+	}
+
+@router.post("/sync/download-batch", summary="Download multiple audio files as ZIP")
+async def api_sync_download_batch(filenames: list[str] = Form(...)):
+	"""Download multiple audio files in a single ZIP."""
+	if not filenames or len(filenames) == 0:
+		raise HTTPException(status_code=400, detail="No filenames provided")
+	
+	if len(filenames) > 100:
+		raise HTTPException(status_code=400, detail="Maximum 100 files per batch")
+	
+	os.makedirs(helpers.TMP_DIR, exist_ok=True)
+	zip_name = f"batch_{uuid.uuid4().hex[:8]}.zip"
+	zip_path = os.path.join(helpers.TMP_DIR, zip_name)
+	
+	with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as z:
+		for filename in filenames:
+			if ".." in filename or "/" in filename or "\\" in filename:
+				continue
+			
+			file_path = os.path.join(helpers.SAMPLES_DIR, filename)
+			if os.path.exists(file_path) and os.path.isfile(file_path):
+				z.write(file_path, arcname=filename)
+	
+	def iterfile():
+		try:
+			with open(zip_path, "rb") as fp:
+				while True:
+					chunk = fp.read(8192)
+					if not chunk:
+						break
+					yield chunk
+		finally:
+			try:
+				os.remove(zip_path)
+			except Exception:
+				pass
+	
+	headers = {"Content-Disposition": f'attachment; filename="{zip_name}"'}
+	return StreamingResponse(iterfile(), media_type="application/zip", headers=headers)
+
+@router.get("/sync/check-updates", summary="Check for server updates")
+def api_sync_check_updates(last_sync: Optional[str] = None):
+	"""Check if server has updates since last sync timestamp."""
+	helpers.load_persisted_store()
+	
+	try:
+		vocab_mtime = os.path.getmtime(helpers.VOCAB_STORE_FILE)
+		server_timestamp = helpers._timestamp_to_str(vocab_mtime)
+	except Exception:
+		server_timestamp = helpers._get_timestamp()
+	
+	has_updates = True
+	if last_sync:
+		has_updates = server_timestamp > last_sync
+	
+	return {
+		"ok": True,
+		"has_updates": has_updates,
+		"server_timestamp": server_timestamp,
+		"total_lessons": len(helpers.LESSONS),
+		"total_samples": len(helpers.PERSISTED_STORE.get("samples", {})),
+		"total_vocab": sum(len(helpers.merged_vocab_for_lesson(l["id"])) for l in helpers.LESSONS)
+	}
+
+@router.get("/sync/manifest", summary="Get complete data manifest")
+def api_sync_manifest():
+	"""Get manifest of all available data for app sync planning."""
+	helpers.load_persisted_store()
+	
+	lessons_manifest = []
+	for lesson in helpers.LESSONS:
+		lesson_id = lesson["id"]
+		vocab_list = helpers.merged_vocab_for_lesson(lesson_id)
+		
+		audio_files = []
+		for vocab in vocab_list:
+			if vocab.get("audio_filename"):
+				audio_files.append({
+					"filename": vocab["audio_filename"],
+					"stream_url": f"/api/audio/stream/{vocab['audio_filename']}",
+					"download_url": f"/api/audio/download/{vocab['audio_filename']}",
+					"word": vocab.get("word")
+				})
+		
+		lessons_manifest.append({
+			"lesson_id": lesson_id,
+			"title": lesson["title"],
+			"vocab_count": len(vocab_list),
+			"audio_files": audio_files
+		})
+	
+	all_audio = []
+	if os.path.exists(helpers.SAMPLES_DIR):
+		for fn in os.listdir(helpers.SAMPLES_DIR):
+			if os.path.isfile(os.path.join(helpers.SAMPLES_DIR, fn)):
+				_, ext = os.path.splitext(fn)
+				if ext.lower() in helpers.ALLOWED_EXTS:
+					all_audio.append({
+						"filename": fn,
+						"stream_url": f"/api/audio/stream/{fn}",
+						"download_url": f"/api/audio/download/{fn}"
+					})
+	
+	return {
+		"ok": True,
+		"lessons": lessons_manifest,
+		"total_audio_files": len(all_audio),
+		"audio_files": all_audio,
+		"server_timestamp": helpers._get_timestamp()
+	}

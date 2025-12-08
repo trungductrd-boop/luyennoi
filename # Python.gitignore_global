@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+*.pyc
+
+# Data
+data/tmp/*
+!data/tmp/.gitkeep
+data/samples/*.wav
+data/samples/*.mp3
+data/users/*
+!data/users/.gitkeep
+data/vocab_store.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Virtual environment
+.venv/
+venv/

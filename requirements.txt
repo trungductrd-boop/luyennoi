@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+pydantic
+numpy
+librosa
+scikit-learn
+python-multipart
+starlette==0.35.1
+soundfile==0.12.1
+scipy==1.11.4
+numba==0.58.1
