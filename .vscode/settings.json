@@ -1,3 +1,5 @@
 {
-    "debug.enableStatusBarColor": false
+    "debug.enableStatusBarColor": false,
+    "python.analysis.extraPaths": ["${workspaceFolder}/.."],
+    "python.analysis.autoSearchPaths": true
 }

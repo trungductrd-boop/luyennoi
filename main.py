@@ -15,8 +15,8 @@ from pydantic import BaseModel
 import uvicorn
 
 # import shared helpers and router
-from . import helpers
-from .audio_api import router as audio_router
+from fastapi_server import helpers
+from fastapi_server.audio_api import router as audio_router
 
 # --- FastAPI app setup ---
 app = FastAPI(
