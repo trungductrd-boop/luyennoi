@@ -17,6 +17,193 @@ router = APIRouter()
 # Constants for streaming
 CHUNK_SIZE = 1024 * 1024  # 1MB
 
+# Additional imports for upload handling
+import json
+import time
+from concurrent.futures import ThreadPoolExecutor
+
+# Background executor for light async processing (placeholder for real queue)
+executor = ThreadPoolExecutor(max_workers=2)
+
+# In-memory task store (task_id -> meta)
+UPLOAD_TASKS: dict = {}
+
+# Default upload limit (can be overridden per endpoint)
+DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB
+
+
+def _detect_audio_type_from_file(path: Path) -> Optional[str]:
+	"""Basic magic-byte sniffing for common audio types. Returns MIME type or None."""
+	try:
+		with open(path, "rb") as f:
+			head = f.read(64)
+	except Exception:
+		return None
+
+	if head.startswith(b"RIFF") and b"WAVE" in head[8:16]:
+		return "audio/wav"
+	if head.startswith(b"ID3") or head[0:2] == b"\xff\xfb":
+		return "audio/mpeg"
+	if head.startswith(b"OggS"):
+		return "audio/ogg"
+	if head.startswith(b"fLaC"):
+		return "audio/flac"
+	# MP4 family (including m4a, 3gp) contains 'ftyp' at offset 4
+	if b"ftyp" in head[4:16]:
+		return "audio/mp4"
+	return None
+
+
+def _require_auth(request: Request) -> bool:
+	"""Simple API key auth: checks Authorization: Bearer <key> against env UPLOAD_API_KEY or helpers.UPLOAD_API_KEY"""
+	auth = request.headers.get("authorization") or request.headers.get("Authorization")
+	if not auth:
+		return False
+	parts = auth.split()
+	if len(parts) != 2 or parts[0].lower() != "bearer":
+		return False
+	token = parts[1]
+	expected = os.environ.get("UPLOAD_API_KEY") or getattr(helpers, "UPLOAD_API_KEY", None)
+	return expected is not None and token == expected
+
+
+def _enqueue_processing(task_id: str, src_path: str, original_filename: str, metadata: dict):
+	"""Submit a background task to convert and move file to samples, update persisted store."""
+	def job():
+		try:
+			sample_id = str(uuid.uuid4())[:8]
+			_, ext = os.path.splitext(original_filename)
+			ext = ext or ".wav"
+			dst_fname = f"{sample_id}{ext}"
+			dst_path = os.path.join(helpers.SAMPLES_DIR, dst_fname)
+
+			# Convert/normalize to wav16 mono (try; fallback to copy)
+			try:
+				conv_path = dst_path
+				helpers.convert_to_wav16_mono(src_path, conv_path)
+			except Exception:
+				# If conversion fails, copy raw
+				shutil.copy2(src_path, dst_path)
+
+			# Register sample in persisted store
+			helpers.load_persisted_store()
+			helpers.PERSISTED_STORE.setdefault("samples", {})
+			helpers.PERSISTED_STORE[sample_id] = {"filename": os.path.basename(dst_path), "lesson_id": metadata.get("lesson_id"), "vocab_id": None}
+			helpers.save_persisted_store()
+
+			UPLOAD_TASKS[task_id]["status"] = "done"
+			UPLOAD_TASKS[task_id]["sample_id"] = sample_id
+			UPLOAD_TASKS[task_id]["filename"] = os.path.basename(dst_path)
+		except Exception as e:
+			UPLOAD_TASKS[task_id]["status"] = "error"
+			UPLOAD_TASKS[task_id]["error"] = str(e)
+		finally:
+			try:
+				os.remove(src_path)
+			except Exception:
+				pass
+
+	executor.submit(job)
+
+
+# -------------------------
+# Upload endpoint
+# -------------------------
+@router.post("/upload", summary="Upload audio file (multipart/form-data)")
+async def api_upload(
+	request: Request,
+	file: UploadFile = File(...),
+	user_id: Optional[str] = Form(None),
+	lesson_id: Optional[str] = Form(None),
+	metadata: Optional[str] = Form(None),
+	max_size: Optional[int] = None,
+):
+	"""Stream-upload an audio file with chunked write, size limit, magic-byte validation, and async processing.
+
+	Returns 202 with task_id for background processing.
+	"""
+	# Auth
+	if not _require_auth(request):
+		raise HTTPException(status_code=401, detail="Unauthorized")
+
+	limit = int(max_size) if max_size else DEFAULT_UPLOAD_LIMIT
+	limit = min(limit, 50 * 1024 * 1024)  # hard cap 50MB
+
+	# Ensure temp dir
+	os.makedirs(helpers.TMP_DIR, exist_ok=True)
+	task_id = str(uuid.uuid4())
+	tmp_fname = f"upload_{task_id}.tmp"
+	tmp_path = os.path.join(helpers.TMP_DIR, tmp_fname)
+
+	# Stream write
+	total = 0
+	try:
+		with open(tmp_path, "wb") as out_f:
+			while True:
+				chunk = await file.read(8192)
+				if not chunk:
+					break
+				total += len(chunk)
+				if total > limit:
+					out_f.close()
+					try:
+						os.remove(tmp_path)
+					except Exception:
+						pass
+					raise HTTPException(status_code=413, detail="File too large")
+				out_f.write(chunk)
+	except HTTPException:
+		raise
+	except Exception as e:
+		try:
+			os.remove(tmp_path)
+		except Exception:
+			pass
+		raise HTTPException(status_code=500, detail=f"Failed to upload: {e}")
+
+	# Basic magic-byte validation
+	detected = _detect_audio_type_from_file(Path(tmp_path))
+	if not detected or not detected.startswith("audio/"):
+		try:
+			os.remove(tmp_path)
+		except Exception:
+			pass
+		raise HTTPException(status_code=400, detail="Uploaded file is not a recognized audio format")
+
+	# Parse metadata JSON if provided
+	meta_obj = {}
+	if metadata:
+		try:
+			meta_obj = json.loads(metadata)
+		except Exception:
+			meta_obj = {"raw": metadata}
+
+	# Register task
+	UPLOAD_TASKS[task_id] = {
+		"status": "queued",
+		"original_filename": file.filename,
+		"size": total,
+		"content_type": detected,
+		"uploaded_at": time.time(),
+		"user_id": user_id,
+		"lesson_id": lesson_id,
+		"metadata": meta_obj,
+	}
+
+	# Enqueue background processing
+	_enqueue_processing(task_id, tmp_path, file.filename, {"lesson_id": lesson_id, **meta_obj})
+
+	return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
+
+
+@router.get("/upload/status/{task_id}")
+def api_upload_status(task_id: str):
+	t = UPLOAD_TASKS.get(task_id)
+	if not t:
+		raise HTTPException(status_code=404, detail="Task not found")
+	return {"task_id": task_id, **t}
+
+
 class VocabItemIn(BaseModel):
 	id: Optional[str] = None
 	word: str

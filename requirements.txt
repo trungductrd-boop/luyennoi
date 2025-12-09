@@ -9,3 +9,6 @@ starlette==0.35.1
 soundfile==0.12.1
 scipy==1.11.4
 numba==0.58.1
+
+# Optional: libmagic-based file type detection (requires system lib on some platforms)
+python-magic
