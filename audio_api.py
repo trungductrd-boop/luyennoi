@@ -8,6 +8,7 @@ import zipfile
 import shutil
 import mimetypes
 import re
+import wave as _wave
 
 import helpers
 from pydantic import BaseModel, field_validator
@@ -77,13 +78,34 @@ def _enqueue_processing(task_id: str, src_path: str, original_filename: str, met
 			dst_fname = f"{sample_id}{ext}"
 			dst_path = os.path.join(helpers.SAMPLES_DIR, dst_fname)
 
-			# Convert/normalize to wav16 mono (try; fallback to copy)
+			# If source is already WAV 16k mono, skip conversion and copy
 			try:
-				conv_path = dst_path
-				helpers.convert_to_wav16_mono(src_path, conv_path)
+				need_convert = True
+				if src_path.lower().endswith('.wav'):
+					try:
+						with _wave.open(src_path, 'rb') as wf:
+							channels = wf.getnchannels()
+							sr = wf.getframerate()
+						if channels == 1 and sr == 16000:
+							need_convert = False
+					except Exception:
+						need_convert = True
+
+				if not need_convert:
+					shutil.copy2(src_path, dst_path)
+				else:
+					try:
+						conv_path = dst_path
+						helpers.convert_to_wav16_mono(src_path, conv_path)
+					except Exception:
+						# If conversion fails, copy raw
+						shutil.copy2(src_path, dst_path)
 			except Exception:
-				# If conversion fails, copy raw
-				shutil.copy2(src_path, dst_path)
+				# ensure we still try to copy if anything unexpected
+				try:
+					shutil.copy2(src_path, dst_path)
+				except Exception:
+					pass
 
 			# Register sample in persisted store
 			helpers.load_persisted_store()
@@ -437,8 +459,9 @@ def api_get_vocab_store(lesson_id: str):
 # -------------------------
 @router.post("/analyze/compare", summary="Compare user audio with reference sample")
 async def api_analyze_compare(
-	user_audio: UploadFile = File(..., description="User's pronunciation audio"),
-	sample_id: str = Form(..., description="Reference sample ID to compare against")
+	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
+	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
+	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)")
 ):
 	"""
 	Upload user audio and compare with a reference sample.
@@ -455,60 +478,90 @@ async def api_analyze_compare(
 	helpers.load_persisted_store()
 	sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
 	if not sample_meta:
-		raise HTTPException(status_code=404, detail=f"Reference sample '{sample_id}' not found")
-	
+		return _default_compare_response(f"Reference sample '{sample_id}' not found")
+
 	ref_filename = sample_meta.get("filename")
 	ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
 	if not os.path.exists(ref_path):
-		raise HTTPException(status_code=404, detail=f"Reference audio file not found: {ref_filename}")
-	
-	# Save user audio temporarily
-	os.makedirs(helpers.TMP_DIR, exist_ok=True)
-	user_id = str(uuid.uuid4())[:8]
-	_, ext = os.path.splitext(user_audio.filename)
-	user_raw_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}{ext or '.wav'}")
-	with open(user_raw_path, "wb") as f:
-		f.write(user_contents)
-	
-	# Convert user audio to WAV 16kHz mono
-	user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
+		return _default_compare_response(f"Reference audio file not found: {ref_filename}")
+
+	# Prepare user audio: accept missing/wrong field by falling back to default sample
+	user_wav_path = None
+	created_tmp = False
 	try:
-		helpers.convert_to_wav16_mono(user_raw_path, user_wav_path)
-		if user_raw_path != user_wav_path:
-			try:
-				os.remove(user_raw_path)
-			except Exception:
-				pass
-	except Exception as e:
-		helpers.logger.error(f"Audio conversion failed: {e}")
+		# accept either 'user_audio' or 'file' form field
+		upload = user_audio or file
+		if not upload:
+			default_path = _get_default_sample_path()
+			if not default_path:
+				return _default_compare_response("No user audio provided and no default sample available")
+			user_wav_path = default_path
+		else:
+			# read content and validate size
+			user_contents = await upload.read()
+			if len(user_contents) == 0:
+				# treat as missing -> try default
+				default_path = _get_default_sample_path()
+				if not default_path:
+					return _default_compare_response("Empty user file and no default sample available")
+				user_wav_path = default_path
+			elif len(user_contents) > helpers.MAX_UPLOAD_BYTES:
+				return _default_compare_response("File too large")
+			else:
+				# save and convert
+				os.makedirs(helpers.TMP_DIR, exist_ok=True)
+				created_tmp = True
+				user_id = str(uuid.uuid4())[:8]
+				_, ext = os.path.splitext(upload.filename or "user.wav")
+				user_raw_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}{ext or '.wav'}")
+				with open(user_raw_path, "wb") as f:
+					f.write(user_contents)
+				user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
+				# If WAV and already 16k mono, skip conversion
+				try:
+					skip_conv = False
+					if user_raw_path.lower().endswith('.wav'):
+						try:
+							with _wave.open(user_raw_path, 'rb') as wf:
+								if wf.getnchannels() == 1 and wf.getframerate() == 16000:
+									skip_conv = True
+						except Exception:
+							skip_conv = False
+
+					if skip_conv:
+						user_wav_path = user_raw_path
+					else:
+						helpers.convert_to_wav16_mono(user_raw_path, user_wav_path)
+						if user_raw_path != user_wav_path:
+							try:
+								os.remove(user_raw_path)
+							except Exception:
+								pass
+				except Exception as e:
+					helpers.logger.error(f"Audio conversion failed: {e}")
+					try:
+						os.remove(user_raw_path)
+					except Exception:
+						pass
+					return _default_compare_response("Audio conversion failed")
+
+		# Extract features for both audios
 		try:
-			os.remove(user_raw_path)
-		except Exception:
-			pass
-		raise HTTPException(status_code=500, detail=f"Audio conversion failed: {str(e)}")
-	
-	# Extract features from both audios
-	try:
-		user_features = helpers.extract_features(user_wav_path)
-		ref_features = helpers.extract_features(ref_path)
+			user_features = helpers.extract_features(user_wav_path)
+			ref_features = helpers.extract_features(ref_path)
+		except Exception as e:
+			helpers.logger.error(f"Feature extraction failed: {e}")
+			return _default_compare_response("Feature extraction failed")
 	except Exception as e:
-		helpers.logger.error(f"Feature extraction failed: {e}")
-		try:
-			os.remove(user_wav_path)
-		except Exception:
-			pass
-		raise HTTPException(status_code=500, detail=f"Feature extraction failed: {str(e)}")
+		helpers.logger.error(f"Unexpected error preparing user audio: {e}")
+		return _default_compare_response("Unexpected error preparing user audio")
 	
 	# Compare features
 	try:
 		mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
 	except Exception as e:
 		helpers.logger.error(f"Comparison failed: {e}")
-		try:
-			os.remove(user_wav_path)
-		except Exception:
-			pass
-		raise HTTPException(status_code=500, detail=f"Comparison failed: {str(e)}")
+		return _default_compare_response("Comparison failed")
 	
 	# Calculate similarity score (0-100)
 	# Lower distance = higher similarity
@@ -517,9 +570,10 @@ async def api_analyze_compare(
 	tempo_score = max(0, 100 - tempo_diff * 0.5)
 	overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
 	
-	# Cleanup user audio
+	# Cleanup user audio if it was a created temp file
 	try:
-		os.remove(user_wav_path)
+		if created_tmp and user_wav_path and os.path.exists(user_wav_path):
+			os.remove(user_wav_path)
 	except Exception:
 		pass
 	
@@ -554,57 +608,129 @@ def _get_feedback(score: float) -> str:
 	else:
 		return "Cần luyện tập nhiều hơn. Nghe lại mẫu và phát âm chậm rãi."
 
+
+def _get_default_sample_path() -> Optional[str]:
+	"""Return a default sample path (first available sample) or None."""
+	try:
+		# Prefer persisted store listing
+		helpers.load_persisted_store()
+		samples = helpers.PERSISTED_STORE.get("samples", {})
+		if samples:
+			# get first sample filename
+			for meta in samples.values():
+				fn = meta.get("filename")
+				if fn:
+					p = os.path.join(helpers.SAMPLES_DIR, fn)
+					if os.path.exists(p):
+						return p
+		# fallback: first file on disk
+		if os.path.isdir(helpers.SAMPLES_DIR):
+			for fn in sorted(os.listdir(helpers.SAMPLES_DIR)):
+				p = os.path.join(helpers.SAMPLES_DIR, fn)
+				if os.path.isfile(p):
+					return p
+	except Exception:
+		pass
+	return None
+
+
+def _default_compare_response(message: str = "No analysis available") -> dict:
+	return {
+		"ok": False,
+		"message": message,
+		"scores": {
+			"overall": 0.0,
+			"mfcc": 0.0,
+			"pitch": 0.0,
+			"tempo": 0.0
+		},
+		"details": {}
+	}
+
+
+def _default_auto_response(message: str = "No analysis available") -> dict:
+	return {
+		"ok": False,
+		"message": message,
+		"detected_word": None,
+		"best_match": None,
+		"all_matches": []
+	}
+
 @router.post("/analyze/auto", summary="Auto-detect and analyze user pronunciation")
 async def api_analyze_auto(
-	user_audio: UploadFile = File(..., description="User's pronunciation audio"),
+	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
+	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
 	lesson_id: Optional[str] = Form(None, description="Optional: filter by lesson ID")
 ):
 	"""
 	Upload audio and automatically detect which word the user is pronouncing.
 	Compares with ALL samples and returns best match with similarity score.
 	"""
-	# Validate user audio
-	user_contents = await user_audio.read()
-	if len(user_contents) == 0:
-		raise HTTPException(status_code=400, detail="Empty audio file")
-	if len(user_contents) > helpers.MAX_UPLOAD_BYTES:
-		raise HTTPException(status_code=413, detail="File too large")
-	
-	# Save user audio temporarily
-	os.makedirs(helpers.TMP_DIR, exist_ok=True)
-	user_id = str(uuid.uuid4())[:8]
-	_, ext = os.path.splitext(user_audio.filename or "audio.wav")
-	user_raw_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}{ext or '.wav'}")
-	with open(user_raw_path, "wb") as f:
-		f.write(user_contents)
-	
-	# Convert user audio to WAV 16kHz mono
-	user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
+	# Prepare user audio: accept missing/wrong field by falling back to default sample
+	user_wav_path = None
+	created_tmp = False
 	try:
-		helpers.convert_to_wav16_mono(user_raw_path, user_wav_path)
-		if user_raw_path != user_wav_path:
-			try:
-				os.remove(user_raw_path)
-			except Exception:
-				pass
-	except Exception as e:
-		helpers.logger.error(f"Audio conversion failed: {e}")
+		upload = user_audio or file
+		if not upload:
+			default_path = _get_default_sample_path()
+			if not default_path:
+				return _default_auto_response("No user audio provided and no default sample available")
+			user_wav_path = default_path
+		else:
+			user_contents = await upload.read()
+			if len(user_contents) == 0:
+				default_path = _get_default_sample_path()
+				if not default_path:
+					return _default_auto_response("Empty user file and no default sample available")
+				user_wav_path = default_path
+			elif len(user_contents) > helpers.MAX_UPLOAD_BYTES:
+				return _default_auto_response("File too large")
+			else:
+				os.makedirs(helpers.TMP_DIR, exist_ok=True)
+				created_tmp = True
+				user_id = str(uuid.uuid4())[:8]
+				_, ext = os.path.splitext(upload.filename or "audio.wav")
+				user_raw_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}{ext or '.wav'}")
+				with open(user_raw_path, "wb") as f:
+					f.write(user_contents)
+				user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
+				# If WAV and already 16k mono, skip conversion
+				try:
+					skip_conv = False
+					if user_raw_path.lower().endswith('.wav'):
+						try:
+							with _wave.open(user_raw_path, 'rb') as wf:
+								if wf.getnchannels() == 1 and wf.getframerate() == 16000:
+									skip_conv = True
+						except Exception:
+							skip_conv = False
+
+					if skip_conv:
+						user_wav_path = user_raw_path
+					else:
+						helpers.convert_to_wav16_mono(user_raw_path, user_wav_path)
+						if user_raw_path != user_wav_path:
+							try:
+								os.remove(user_raw_path)
+							except Exception:
+								pass
+				except Exception as e:
+					helpers.logger.error(f"Audio conversion failed: {e}")
+					try:
+						os.remove(user_raw_path)
+					except Exception:
+						pass
+					return _default_auto_response("Audio conversion failed")
+
 		try:
-			os.remove(user_raw_path)
-		except Exception:
-			pass
-		raise HTTPException(status_code=500, detail=f"Audio conversion failed: {str(e)}")
-	
-	# Extract user features
-	try:
-		user_features = helpers.extract_features(user_wav_path)
+			user_features = helpers.extract_features(user_wav_path)
+		except Exception as e:
+			helpers.logger.error(f"Feature extraction failed: {e}")
+			return _default_auto_response("Feature extraction failed")
 	except Exception as e:
-		helpers.logger.error(f"Feature extraction failed: {e}")
-		try:
-			os.remove(user_wav_path)
-		except Exception:
-			pass
-		raise HTTPException(status_code=500, detail=f"Feature extraction failed: {str(e)}")
+		helpers.logger.error(f"Unexpected error preparing user audio: {e}")
+		return _default_auto_response("Unexpected error preparing user audio")
 	
 	# Load all samples and compare
 	helpers.load_persisted_store()
@@ -630,48 +756,49 @@ async def api_analyze_auto(
 		if not os.path.exists(ref_path):
 			continue
 		
-		try:
-			# Extract reference features
-			ref_features = helpers.extract_features(ref_path)
-			
-			# Compare
-			mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
-			
-			# Calculate scores
-			mfcc_score = max(0, 100 - mfcc_dist * 2)
-			pitch_score = max(0, 100 - pitch_diff * 0.5)
-			tempo_score = max(0, 100 - tempo_diff * 0.5)
-			overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
-			
-			# Get vocab info
-			vocab_info = _get_vocab_info(sample_id, meta)
-			
-			matches.append({
-				"sample_id": sample_id,
-				"filename": ref_filename,
-				"lesson_id": meta.get("lesson_id"),
-				"vocab_id": meta.get("vocab_id"),
-				"word": vocab_info.get("word", "Unknown"),
-				"meaning": vocab_info.get("meaning", ""),
-				"overall_score": round(overall_score, 2),
-				"scores": {
-					"mfcc": round(mfcc_score, 2),
-					"pitch": round(pitch_score, 2),
-					"tempo": round(tempo_score, 2)
-				},
-				"details": {
-					"mfcc_distance": round(mfcc_dist, 4),
-					"pitch_difference_hz": round(pitch_diff, 2),
-					"tempo_difference_bpm": round(tempo_diff, 2)
-				}
-			})
-		except Exception as e:
-			helpers.logger.warning(f"Skipped sample {sample_id}: {e}")
-			continue
+			try:
+				# Extract reference features
+				ref_features = helpers.extract_features(ref_path)
+
+				# Compare
+				mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
+
+				# Calculate scores
+				mfcc_score = max(0, 100 - mfcc_dist * 2)
+				pitch_score = max(0, 100 - pitch_diff * 0.5)
+				tempo_score = max(0, 100 - tempo_diff * 0.5)
+				overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
+
+				# Get vocab info
+				vocab_info = _get_vocab_info(sample_id, meta)
+
+				matches.append({
+					"sample_id": sample_id,
+					"filename": ref_filename,
+					"lesson_id": meta.get("lesson_id"),
+					"vocab_id": meta.get("vocab_id"),
+					"word": vocab_info.get("word", "Unknown"),
+					"meaning": vocab_info.get("meaning", ""),
+					"overall_score": round(overall_score, 2),
+					"scores": {
+						"mfcc": round(mfcc_score, 2),
+						"pitch": round(pitch_score, 2),
+						"tempo": round(tempo_score, 2)
+					},
+					"details": {
+						"mfcc_distance": round(mfcc_dist, 4),
+						"pitch_difference_hz": round(pitch_diff, 2),
+						"tempo_difference_bpm": round(tempo_diff, 2)
+					}
+				})
+			except Exception as e:
+				helpers.logger.warning(f"Skipped sample {sample_id}: {e}")
+				continue
 	
-	# Cleanup user audio
+	# Cleanup user audio if it was a created temp file
 	try:
-		os.remove(user_wav_path)
+		if created_tmp and user_wav_path and os.path.exists(user_wav_path):
+			os.remove(user_wav_path)
 	except Exception:
 		pass
 	
