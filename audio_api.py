@@ -469,78 +469,40 @@ async def api_analyze_compare(
 	"""
 
 
-@router.post("/analyze", summary="Simple analyze (compat)")
-async def api_analyze(file: UploadFile = File(...)):
-	"""Compatibility endpoint: accepts a single uploaded file and
-	returns basic validation info. Useful for clients that expect
-	a plain `/analyze` route (e.g., quick Flutter checks).
+@router.post("/analyze", summary="Analyze user audio (compare or auto)")
+async def api_analyze(
+	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
+	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
+	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)")
+):
 	"""
-	req_id = f"req_{uuid.uuid4().hex[:6]}"
-	helpers.logger.info(f"{req_id} - File received | name={file.filename} type={file.content_type}")
+	Compatibility endpoint that either compares uploaded user audio against a
+	reference sample (when `sample_id` provided) or automatically compares
+	against all registered samples and returns the best match.
+	Accepts multipart/form-data with field `user_audio` or `file`.
+	"""
+	# accept either 'user_audio' or 'file'
+	upload = user_audio or file
 
-	try:
-		data = await file.read()
-	except Exception as e:
-		helpers.logger.error(f"{req_id} - Error reading file: {e}")
-		raise HTTPException(status_code=400, detail="Failed to read uploaded file")
-
-	size = len(data)
-	helpers.logger.info(f"{req_id} - File size | {size} bytes")
-
-	if size == 0:
-		raise HTTPException(status_code=400, detail="Empty file")
-
-	if hasattr(helpers, "MAX_UPLOAD_BYTES") and size > helpers.MAX_UPLOAD_BYTES:
-		raise HTTPException(status_code=413, detail="File too large")
-
-	# Warn if content type is not audio/* but don't reject (some clients omit it)
-	if file.content_type and not file.content_type.startswith("audio/"):
-		helpers.logger.warning(f"{req_id} - Unexpected content type: {file.content_type}")
-
-	return {"ok": True, "req_id": req_id, "filename": file.filename, "size": size}
-
-	# Validate user audio
-	user_contents = await user_audio.read()
-	if len(user_contents) == 0:
-		raise HTTPException(status_code=400, detail="Empty audio file")
-	if len(user_contents) > helpers.MAX_UPLOAD_BYTES:
-		raise HTTPException(status_code=413, detail="File too large")
-	
-	# Get reference sample info
-	helpers.load_persisted_store()
-	sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
-	if not sample_meta:
-		return _default_compare_response(f"Reference sample '{sample_id}' not found")
-
-	ref_filename = sample_meta.get("filename")
-	ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
-	if not os.path.exists(ref_path):
-		return _default_compare_response(f"Reference audio file not found: {ref_filename}")
-
-	# Prepare user audio: accept missing/wrong field by falling back to default sample
+	# Prepare user audio (allow fallback to default sample when missing)
 	user_wav_path = None
 	created_tmp = False
 	try:
-		# accept either 'user_audio' or 'file' form field
-		upload = user_audio or file
 		if not upload:
 			default_path = _get_default_sample_path()
 			if not default_path:
 				return _default_compare_response("No user audio provided and no default sample available")
 			user_wav_path = default_path
 		else:
-			# read content and validate size
 			user_contents = await upload.read()
 			if len(user_contents) == 0:
-				# treat as missing -> try default
 				default_path = _get_default_sample_path()
 				if not default_path:
 					return _default_compare_response("Empty user file and no default sample available")
 				user_wav_path = default_path
-			elif len(user_contents) > helpers.MAX_UPLOAD_BYTES:
+			elif hasattr(helpers, "MAX_UPLOAD_BYTES") and len(user_contents) > helpers.MAX_UPLOAD_BYTES:
 				return _default_compare_response("File too large")
 			else:
-				# save and convert
 				os.makedirs(helpers.TMP_DIR, exist_ok=True)
 				created_tmp = True
 				user_id = str(uuid.uuid4())[:8]
@@ -577,55 +539,139 @@ async def api_analyze(file: UploadFile = File(...)):
 						pass
 					return _default_compare_response("Audio conversion failed")
 
-		# Extract features for both audios
+		# If sample_id provided -> compare with that sample
+		if sample_id:
+			helpers.load_persisted_store()
+			sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
+			if not sample_meta:
+				return _default_compare_response(f"Reference sample '{sample_id}' not found")
+			ref_filename = sample_meta.get("filename")
+			ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
+			if not os.path.exists(ref_path):
+				return _default_compare_response(f"Reference audio file not found: {ref_filename}")
+
+			try:
+				user_features = helpers.extract_features(user_wav_path)
+				ref_features = helpers.extract_features(ref_path)
+			except Exception as e:
+				helpers.logger.error(f"Feature extraction failed: {e}")
+				return _default_compare_response("Feature extraction failed")
+
+			try:
+				mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
+			except Exception as e:
+				helpers.logger.error(f"Comparison failed: {e}")
+				return _default_compare_response("Comparison failed")
+
+			mfcc_score = max(0, 100 - mfcc_dist * 2)
+			pitch_score = max(0, 100 - pitch_diff * 0.5)
+			tempo_score = max(0, 100 - tempo_diff * 0.5)
+			overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
+
+			# Cleanup
+			try:
+				if created_tmp and user_wav_path and os.path.exists(user_wav_path):
+					os.remove(user_wav_path)
+			except Exception:
+				pass
+
+			return {
+				"ok": True,
+				"sample_id": sample_id,
+				"reference_file": ref_filename,
+				"scores": {
+					"overall": round(overall_score, 2),
+					"mfcc": round(mfcc_score, 2),
+					"pitch": round(pitch_score, 2),
+					"tempo": round(tempo_score, 2)
+				},
+				"details": {
+					"mfcc_distance": round(mfcc_dist, 4),
+					"pitch_difference_hz": round(pitch_diff, 2),
+					"tempo_difference_bpm": round(tempo_diff, 2)
+				},
+				"feedback": _get_feedback(overall_score)
+			}
+
+		# Otherwise, auto-detect best matching sample across all samples
 		try:
 			user_features = helpers.extract_features(user_wav_path)
-			ref_features = helpers.extract_features(ref_path)
 		except Exception as e:
 			helpers.logger.error(f"Feature extraction failed: {e}")
-			return _default_compare_response("Feature extraction failed")
+			return _default_auto_response("Feature extraction failed")
+
+		helpers.load_persisted_store()
+		samples_meta = helpers.PERSISTED_STORE.get("samples", {})
+		if not samples_meta:
+			try:
+				if created_tmp and user_wav_path and os.path.exists(user_wav_path):
+					os.remove(user_wav_path)
+			except Exception:
+				pass
+			raise HTTPException(status_code=404, detail="No reference samples found. Please upload sample audios first.")
+
+		matches = []
+		for s_id, meta in samples_meta.items():
+			ref_filename = meta.get("filename")
+			ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
+			if not os.path.exists(ref_path):
+				continue
+			try:
+				ref_features = helpers.extract_features(ref_path)
+				mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
+				mfcc_score = max(0, 100 - mfcc_dist * 2)
+				pitch_score = max(0, 100 - pitch_diff * 0.5)
+				tempo_score = max(0, 100 - tempo_diff * 0.5)
+				overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
+
+				vocab_info = _get_vocab_info(s_id, meta)
+
+				matches.append({
+					"sample_id": s_id,
+					"filename": ref_filename,
+					"lesson_id": meta.get("lesson_id"),
+					"vocab_id": meta.get("vocab_id"),
+					"word": vocab_info.get("word", "Unknown"),
+					"meaning": vocab_info.get("meaning", ""),
+					"overall_score": round(overall_score, 2),
+					"scores": {
+						"mfcc": round(mfcc_score, 2),
+						"pitch": round(pitch_score, 2),
+						"tempo": round(tempo_score, 2)
+					},
+					"details": {
+						"mfcc_distance": round(mfcc_dist, 4),
+						"pitch_difference_hz": round(pitch_diff, 2),
+						"tempo_difference_bpm": round(tempo_diff, 2)
+					}
+				})
+			except Exception as e:
+				helpers.logger.warning(f"Skipped sample {s_id}: {e}")
+				continue
+
+		try:
+			if created_tmp and user_wav_path and os.path.exists(user_wav_path):
+				os.remove(user_wav_path)
+		except Exception:
+			pass
+
+		if not matches:
+			raise HTTPException(status_code=404, detail="No matching samples found")
+
+		matches.sort(key=lambda x: x["overall_score"], reverse=True)
+		best_match = matches[0]
+
+		return {
+			"ok": True,
+			"detected_word": best_match["word"],
+			"best_match": best_match,
+			"all_matches": matches[:5],
+			"total_compared": len(matches),
+			"feedback": _get_feedback(best_match["overall_score"])
+		}
 	except Exception as e:
-		helpers.logger.error(f"Unexpected error preparing user audio: {e}")
+		helpers.logger.error(f"Unexpected error in /analyze: {e}")
 		return _default_compare_response("Unexpected error preparing user audio")
-	
-	# Compare features
-	try:
-		mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
-	except Exception as e:
-		helpers.logger.error(f"Comparison failed: {e}")
-		return _default_compare_response("Comparison failed")
-	
-	# Calculate similarity score (0-100)
-	# Lower distance = higher similarity
-	mfcc_score = max(0, 100 - mfcc_dist * 2)  # Adjust multiplier as needed
-	pitch_score = max(0, 100 - pitch_diff * 0.5)
-	tempo_score = max(0, 100 - tempo_diff * 0.5)
-	overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
-	
-	# Cleanup user audio if it was a created temp file
-	try:
-		if created_tmp and user_wav_path and os.path.exists(user_wav_path):
-			os.remove(user_wav_path)
-	except Exception:
-		pass
-	
-	return {
-		"ok": True,
-		"sample_id": sample_id,
-		"reference_file": ref_filename,
-		"scores": {
-			"overall": round(overall_score, 2),
-			"mfcc": round(mfcc_score, 2),
-			"pitch": round(pitch_score, 2),
-			"tempo": round(tempo_score, 2)
-		},
-		"details": {
-			"mfcc_distance": round(mfcc_dist, 4),
-			"pitch_difference_hz": round(pitch_diff, 2),
-			"tempo_difference_bpm": round(tempo_diff, 2)
-		},
-		"feedback": _get_feedback(overall_score)
-	}
 
 def _get_feedback(score: float) -> str:
 	"""Generate feedback message based on score"""
