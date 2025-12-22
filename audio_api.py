@@ -467,6 +467,38 @@ async def api_analyze_compare(
 	Upload user audio and compare with a reference sample.
 	Returns similarity scores for pronunciation accuracy.
 	"""
+
+
+@router.post("/analyze", summary="Simple analyze (compat)")
+async def api_analyze(file: UploadFile = File(...)):
+	"""Compatibility endpoint: accepts a single uploaded file and
+	returns basic validation info. Useful for clients that expect
+	a plain `/analyze` route (e.g., quick Flutter checks).
+	"""
+	req_id = f"req_{uuid.uuid4().hex[:6]}"
+	helpers.logger.info(f"{req_id} - File received | name={file.filename} type={file.content_type}")
+
+	try:
+		data = await file.read()
+	except Exception as e:
+		helpers.logger.error(f"{req_id} - Error reading file: {e}")
+		raise HTTPException(status_code=400, detail="Failed to read uploaded file")
+
+	size = len(data)
+	helpers.logger.info(f"{req_id} - File size | {size} bytes")
+
+	if size == 0:
+		raise HTTPException(status_code=400, detail="Empty file")
+
+	if hasattr(helpers, "MAX_UPLOAD_BYTES") and size > helpers.MAX_UPLOAD_BYTES:
+		raise HTTPException(status_code=413, detail="File too large")
+
+	# Warn if content type is not audio/* but don't reject (some clients omit it)
+	if file.content_type and not file.content_type.startswith("audio/"):
+		helpers.logger.warning(f"{req_id} - Unexpected content type: {file.content_type}")
+
+	return {"ok": True, "req_id": req_id, "filename": file.filename, "size": size}
+
 	# Validate user audio
 	user_contents = await user_audio.read()
 	if len(user_contents) == 0:

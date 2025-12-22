@@ -45,6 +45,8 @@ app.add_middleware(
 
 # include audio-related router (uploads, samples, lessons...)
 app.include_router(audio_router, prefix="/api", tags=["Audio & Vocab"])
+# Also include without prefix for compatibility with clients hitting /analyze
+app.include_router(audio_router)
 
 # Serve static files for HTML/CSS/JS frontend
 STATIC_DIR = Path("static").resolve()
