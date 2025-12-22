@@ -44,15 +44,29 @@ LESSONS = [
 
 VOCAB = {
     "1": [
-        {"id": "1_1", "word": "Xin chào", "meaning": "Hello", "example": "Xin chào bạn!", "audio_filename": "xin_chao.wav"},
-        {"id": "1_2", "word": "Tạm biệt", "meaning": "Goodbye", "example": "Tạm biệt nhé!", "audio_filename": "tam_biet.wav"},
+        {"id": "1_1", "word": "Xin chào", "meaning": "Hello", "example": "Xin chào bạn!", "audio_filename": "xin_chao.mp3"},
+        {"id": "1_2", "word": "Tạm biệt", "meaning": "Goodbye", "example": "Tạm biệt nhé!", "audio_filename": "tam_biet.mp3"},
     ],
     "2": [
-        {"id": "2_1", "word": "Mẹ", "meaning": "Mother", "example": "Mẹ của tôi...", "audio_filename": "me.wav"},
-        {"id": "2_2", "word": "Cha", "meaning": "Father", "example": "Cha làm nghề...", "audio_filename": "cha.wav"},
+        {"id": "2_1", "word": "Mẹ", "meaning": "Mother", "example": "Mẹ của tôi...", "audio_filename": "me.mp3"},
+        {"id": "2_2", "word": "Cha", "meaning": "Father", "example": "Cha làm nghề...", "audio_filename": "cha.mp3"},
+        {"id": "2_3", "word": "Anh trai", "meaning": "Brother", "example": "Anh trai tôi...", "audio_filename": "anh_trai.mp3"},
     ],
     "3": [
-        {"id": "3_1", "word": "Phở", "meaning": "Pho (noodle soup)", "example": "Tôi thích phở.", "audio_filename": "pho.wav"},
+        {"id": "3_1", "word": "Phở", "meaning": "Pho (noodle soup)", "example": "Tôi thích phở.", "audio_filename": "pho_dc1c9090-192c-4529-a74b-2325b488b86e.mp3"},
+    ],
+    "5": [
+        {"id": "5_1", "word": "Đỏ", "meaning": "Red", "example": "Quả táo màu đỏ.", "audio_filename": "do_1c414482-56cd-43e5-a6cb-998a961d07a2.mp3"},
+        {"id": "5_2", "word": "Vàng", "meaning": "Yellow", "example": "Hoa hướng dương màu vàng.", "audio_filename": "vang_1f4a223d-3ca2-4134-8894-b6a2070b6a1d.mp3"},
+        {"id": "5_3", "word": "Xanh dương", "meaning": "Blue", "example": "Bầu trời xanh dương.", "audio_filename": "xanh_duong_a9788857-607d-430b-8e85-bd81fb7be85c.mp3"},
+        {"id": "5_4", "word": "Xanh lá", "meaning": "Green", "example": "Lá cây màu xanh lá.", "audio_filename": "xanh_la_d5211260-62b1-4786-8dea-47057a94e172.mp3"},
+    ],
+    "6": [
+        {"id": "6_1", "word": "Chó", "meaning": "Dog", "example": "Con chó của tôi.", "audio_filename": "cho_a7869b6f-d0b5-455b-ae21-43c628acc6cc.mp3"},
+        {"id": "6_2", "word": "Mèo", "meaning": "Cat", "example": "Con mèo thích ngủ.", "audio_filename": "meo_dd324ca4-d60b-4ff0-9eba-4d7da40dc485.mp3"},
+        {"id": "6_3", "word": "Gà", "meaning": "Chicken", "example": "Gà gáy vào buổi sáng.", "audio_filename": "ga_74dd0293-bbd8-4bc3-bdaf-ebdd76442d06.mp3"},
+        {"id": "6_4", "word": "Heo", "meaning": "Pig", "example": "Heo sống trong chuồng.", "audio_filename": "heo_a731d482-0034-47e6-bab1-2616151e1c3b.mp3"},
+        {"id": "6_5", "word": "Chim", "meaning": "Bird", "example": "Chim hót trên cây.", "audio_filename": "chim_a40a2c8e-6ea4-4583-8a0f-8e8bb0f831c4.mp3"},
     ],
 }
 
