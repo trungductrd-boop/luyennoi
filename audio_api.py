@@ -343,6 +343,76 @@ def api_samples_rescan():
 	report = helpers.rescan_samples()
 	return {"ok": True, "report": report}
 
+
+@router.post("/samples/link", summary="Link a sample to a lesson/vocab")
+def api_samples_link(sample_id: str = Form(...), lesson_id: Optional[str] = Form(None), vocab_id: Optional[str] = Form(None)):
+	"""Link an existing sample (by sample_id) to a lesson and/or vocab entry.
+
+	- Updates `helpers.PERSISTED_STORE['samples'][sample_id]` with `lesson_id` and `vocab_id`.
+	- Ensures the vocab entry exists in persisted lessons (creates minimal entry if missing) and sets its `audio_filename` to the sample filename.
+	"""
+	helpers.load_persisted_store()
+	samples = helpers.PERSISTED_STORE.setdefault("samples", {})
+	sample = samples.get(sample_id)
+	if not sample:
+		raise HTTPException(status_code=404, detail="sample_id not found")
+
+	# Update lesson association if provided
+	if lesson_id:
+		sample["lesson_id"] = lesson_id
+
+	# If vocab_id provided, ensure vocab exists in persisted lessons and set audio_filename
+	lessons_store = helpers.PERSISTED_STORE.setdefault("lessons", {})
+	target_lesson = lesson_id or sample.get("lesson_id")
+
+	if vocab_id:
+		# ensure lesson bucket exists
+		if target_lesson:
+			lessons_store.setdefault(target_lesson, lessons_store.get(target_lesson, []))
+
+		found = False
+		if target_lesson and target_lesson in lessons_store:
+			for v in lessons_store[target_lesson]:
+				if v.get("id") == vocab_id:
+					v["audio_filename"] = sample.get("filename")
+					found = True
+					break
+
+		# If not found in persisted lessons, try built-in VOCAB and import it (with audio)
+		if not found and target_lesson and target_lesson in helpers.VOCAB:
+			for v in helpers.VOCAB[target_lesson]:
+				if v.get("id") == vocab_id:
+					# copy into persisted store and attach audio_filename
+					new_v = {**v}
+					new_v["audio_filename"] = sample.get("filename")
+					lessons_store[target_lesson].append(new_v)
+					found = True
+					break
+
+		# If still not found, create a minimal vocab entry under target_lesson (or '0' bucket)
+		if not found:
+			bucket = target_lesson or "0"
+			lessons_store.setdefault(bucket, lessons_store.get(bucket, []))
+			new_v = {"id": vocab_id, "word": vocab_id, "meaning": "", "example": "", "audio_filename": sample.get("filename")}
+			lessons_store[bucket].append(new_v)
+
+		# Finally, set sample meta
+		sample["vocab_id"] = vocab_id
+
+	# Persist changes
+	helpers.save_persisted_store()
+
+	# Build response objects
+	vocab_obj = None
+	if vocab_id:
+		bucket = target_lesson or "0"
+		for v in helpers.PERSISTED_STORE.get("lessons", {}).get(bucket, []):
+			if v.get("id") == vocab_id:
+				vocab_obj = {**v, "audio_url": f"/static/samples/{v.get('audio_filename')}" if v.get('audio_filename') else None}
+				break
+
+	return {"ok": True, "sample_id": sample_id, "sample": sample, "vocab": vocab_obj}
+
 @router.get("/samples/export-package", summary="Export samples + vocab_store.json as a zip for offline use")
 def api_export_package():
 	package_name = f"speech_package_{uuid.uuid4().hex[:8]}.zip"
