@@ -679,7 +679,8 @@ async def api_analyze_compare(
 				"pitch_difference_hz": round(pitch_diff, 2),
 				"tempo_difference_bpm": round(tempo_diff, 2)
 			},
-			"feedback": _get_feedback(overall_score)
+			"feedback": _get_feedback(overall_score),
+			"comment": _get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff)
 		}
 
 	except Exception as e:
@@ -807,7 +808,8 @@ async def api_analyze(
 					"pitch_difference_hz": round(pitch_diff, 2),
 					"tempo_difference_bpm": round(tempo_diff, 2)
 				},
-				"feedback": _get_feedback(overall_score)
+				"feedback": _get_feedback(overall_score),
+				"comment": _get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff)
 			}
 
 		# Otherwise, auto-detect best matching sample across all samples
@@ -861,6 +863,7 @@ async def api_analyze(
 						"pitch_difference_hz": round(pitch_diff, 2),
 						"tempo_difference_bpm": round(tempo_diff, 2)
 					}
+					,"comment": _get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff)
 				})
 			except Exception as e:
 				helpers.logger.warning(f"Skipped sample {s_id}: {e}")
@@ -884,7 +887,13 @@ async def api_analyze(
 			"best_match": best_match,
 			"all_matches": matches[:5],
 			"total_compared": len(matches),
-			"feedback": _get_feedback(best_match["overall_score"])
+			"feedback": _get_feedback(best_match["overall_score"]),
+			"comment": _get_review(
+				best_match["overall_score"],
+				best_match.get("details", {}).get("mfcc_distance"),
+				best_match.get("details", {}).get("pitch_difference_hz"),
+				best_match.get("details", {}).get("tempo_difference_bpm")
+			)
 		}
 	except Exception as e:
 		helpers.logger.error(f"Unexpected error in /analyze: {e}")
@@ -902,6 +911,56 @@ def _get_feedback(score: float) -> str:
 		return "Cần cải thiện. Hãy nghe kỹ mẫu và thử lại."
 	else:
 		return "Cần luyện tập nhiều hơn. Nghe lại mẫu và phát âm chậm rãi."
+
+
+def _get_review(score: float, mfcc_dist: Optional[float] = None, pitch_diff: Optional[float] = None, tempo_diff: Optional[float] = None) -> str:
+	"""Generate a detailed bilingual (VN/EN) technical review including numeric metrics and actionable tips.
+
+	Produces a multi-clause string describing overall level, component issues (MFCC ~ pronunciation quality, pitch difference in Hz, tempo difference in BPM),
+	and concrete exercises to improve. Intended for C (detailed) mode.
+	"""
+	lines = []
+	# Overall
+	if score >= 90:
+		lines.append(f"Rất tốt (Overall: {score:.1f}). Your pronunciation closely matches the reference.")
+	elif score >= 75:
+		lines.append(f"Tốt (Overall: {score:.1f}). Good match with minor issues to address.")
+	elif score >= 60:
+		lines.append(f"Khá (Overall: {score:.1f}). Noticeable differences — focus practice on specific sounds.")
+	elif score >= 40:
+		lines.append(f"Cần cải thiện (Overall: {score:.1f}). Clear mismatches; work on articulation and prosody.")
+	else:
+		lines.append(f"Cần luyện tập nhiều (Overall: {score:.1f}). Start from slow repetition and mimicry exercises.")
+
+	# MFCC / pronunciation quality
+	if mfcc_dist is not None:
+		lines.append(f"Pronunciation distance (MFCC): {mfcc_dist:.2f} — lower is better.")
+		if mfcc_dist > 40:
+			lines.append("Recommendation: isolate consonants and vowel endings; practice minimal pairs and slow repetition.")
+		elif mfcc_dist > 15:
+			lines.append("Recommendation: repeat problematic syllables and compare spectrograms or waveform to the sample.")
+
+	# Pitch / intonation
+	if pitch_diff is not None:
+		lines.append(f"Pitch difference: {pitch_diff:.2f} Hz.")
+		if pitch_diff > 40:
+			lines.append("Tip: practice pitch contour — record rising/falling intonation and match the sample.")
+		elif pitch_diff > 10:
+			lines.append("Tip: focus on stress and slight pitch adjustments to match natural prosody.")
+
+	# Tempo / speed
+	if tempo_diff is not None:
+		lines.append(f"Tempo difference: {tempo_diff:.2f} BPM.")
+		if tempo_diff > 20:
+			lines.append("Tip: slow down or speed up to match sample rhythm; clap or tap the syllable beats.")
+		elif tempo_diff > 5:
+			lines.append("Tip: adjust speaking rate to better align with sample phrasing.")
+
+	# Closing practical exercise
+	lines.append("Practice: listen–imitate–record cycles (3x), focus 5–10s segments, and compare waveforms or pitch traces.")
+
+	# Join as a single paragraph
+	return " ".join(lines)
 
 
 def _get_default_sample_path() -> Optional[str]:
@@ -1085,6 +1144,7 @@ async def api_analyze_auto(
 						"pitch_difference_hz": round(pitch_diff, 2),
 						"tempo_difference_bpm": round(tempo_diff, 2)
 					}
+					,"comment": _get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff)
 				})
 			except Exception as e:
 				helpers.logger.warning(f"Skipped sample {sample_id}: {e}")
@@ -1110,7 +1170,13 @@ async def api_analyze_auto(
 		"best_match": best_match,
 		"all_matches": matches[:5],  # Top 5 matches
 		"total_compared": len(matches),
-		"feedback": _get_feedback(best_match["overall_score"])
+		"feedback": _get_feedback(best_match["overall_score"]),
+		"comment": _get_review(
+			best_match["overall_score"],
+			best_match.get("details", {}).get("mfcc_distance"),
+			best_match.get("details", {}).get("pitch_difference_hz"),
+			best_match.get("details", {}).get("tempo_difference_bpm")
+		)
 	}
 
 
@@ -1242,6 +1308,7 @@ async def api_analyze_vocab(
 						"pitch_difference_hz": round(pitch_diff, 2),
 						"tempo_difference_bpm": round(tempo_diff, 2)
 					}
+					,"comment": _get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff)
 				})
 			except Exception as e:
 				helpers.logger.warning(f"Skipped sample {s_id}: {e}")
@@ -1266,7 +1333,13 @@ async def api_analyze_vocab(
 			"best_match": best,
 			"all_matches": matches[:5],
 			"total_compared": len(matches),
-			"feedback": _get_feedback(best["overall_score"]) 
+			"feedback": _get_feedback(best["overall_score"]),
+			"comment": _get_review(
+				best["overall_score"],
+				best.get("details", {}).get("mfcc_distance"),
+				best.get("details", {}).get("pitch_difference_hz"),
+				best.get("details", {}).get("tempo_difference_bpm")
+			) 
 		}
 
 	except Exception as e:
