@@ -8,8 +8,9 @@ import zipfile
 import shutil
 import mimetypes
 import re
-import wave as _wave
 
+# audio helpers & globals
+import wave as _wave
 import helpers
 from pydantic import BaseModel, field_validator
 
@@ -18,13 +19,74 @@ router = APIRouter()
 # Constants for streaming
 CHUNK_SIZE = 1024 * 1024  # 1MB
 
-# Additional imports for upload handling
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
-# Background executor for light async processing (placeholder for real queue)
-executor = ThreadPoolExecutor(max_workers=2)
+# Background executor for light async processing
+executor = ThreadPoolExecutor(max_workers=8)
+
+# In-memory cache for extracted sample features to avoid repeated costly extraction
+SAMPLE_FEATURES: dict = {}
+SAMPLE_FEATURES_LOCK = threading.Lock()
+
+
+def _get_cached_features(path: str):
+	"""Return cached features for `path` or extract and cache them. Returns None on failure."""
+	if not path:
+		return None
+	key = os.path.abspath(path)
+	with SAMPLE_FEATURES_LOCK:
+		if key in SAMPLE_FEATURES:
+			return SAMPLE_FEATURES[key]
+	try:
+		feats = helpers.extract_features(path)
+	except Exception:
+		return None
+	with SAMPLE_FEATURES_LOCK:
+		SAMPLE_FEATURES[key] = feats
+	return feats
+
+
+def _build_match_entry(sample_id: str, meta: dict, ref_path: str, user_features: dict):
+	"""Compute comparison between `user_features` and reference at `ref_path` and return match dict or None."""
+	try:
+		ref_features = _get_cached_features(ref_path)
+		if not ref_features:
+			return None
+		mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
+
+		mfcc_score = max(0, 100 - mfcc_dist * 2)
+		pitch_score = max(0, 100 - pitch_diff * 0.5)
+		tempo_score = max(0, 100 - tempo_diff * 0.5)
+		overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
+
+		vocab_info = _get_vocab_info(sample_id, meta)
+
+		return {
+			"sample_id": sample_id,
+			"filename": os.path.basename(ref_path),
+			"lesson_id": meta.get("lesson_id"),
+			"vocab_id": meta.get("vocab_id"),
+			"word": vocab_info.get("word", "Unknown"),
+			"meaning": vocab_info.get("meaning", ""),
+			"overall_score": round(overall_score, 2),
+			"scores": {
+				"mfcc": round(mfcc_score, 2),
+				"pitch": round(pitch_score, 2),
+				"tempo": round(tempo_score, 2)
+			},
+			"details": {
+				"mfcc_distance": round(mfcc_dist, 4),
+				"pitch_difference_hz": round(pitch_diff, 2),
+				"tempo_difference_bpm": round(tempo_diff, 2)
+			},
+			"comment": _get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff)
+		}
+	except Exception:
+		return None
+
 
 # In-memory task store (task_id -> meta)
 UPLOAD_TASKS: dict = {}
@@ -829,45 +891,28 @@ async def api_analyze(
 				pass
 			raise HTTPException(status_code=404, detail="No reference samples found. Please upload sample audios first.")
 
-		matches = []
+		# Build candidate list then compare in parallel to reduce latency
+		candidates = []
 		for s_id, meta in samples_meta.items():
 			ref_filename = meta.get("filename")
 			ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
 			if not os.path.exists(ref_path):
 				continue
-			try:
-				ref_features = helpers.extract_features(ref_path)
-				mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
-				mfcc_score = max(0, 100 - mfcc_dist * 2)
-				pitch_score = max(0, 100 - pitch_diff * 0.5)
-				tempo_score = max(0, 100 - tempo_diff * 0.5)
-				overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
+			candidates.append((s_id, meta, ref_path))
 
-				vocab_info = _get_vocab_info(s_id, meta)
-
-				matches.append({
-					"sample_id": s_id,
-					"filename": ref_filename,
-					"lesson_id": meta.get("lesson_id"),
-					"vocab_id": meta.get("vocab_id"),
-					"word": vocab_info.get("word", "Unknown"),
-					"meaning": vocab_info.get("meaning", ""),
-					"overall_score": round(overall_score, 2),
-					"scores": {
-						"mfcc": round(mfcc_score, 2),
-						"pitch": round(pitch_score, 2),
-						"tempo": round(tempo_score, 2)
-					},
-					"details": {
-						"mfcc_distance": round(mfcc_dist, 4),
-						"pitch_difference_hz": round(pitch_diff, 2),
-						"tempo_difference_bpm": round(tempo_diff, 2)
-					}
-					,"comment": _get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff)
-				})
-			except Exception as e:
-				helpers.logger.warning(f"Skipped sample {s_id}: {e}")
-				continue
+		matches = []
+		if candidates:
+			max_workers = min(6, len(candidates))
+			with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
+				futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, user_features) for (s_id, meta, ref_path) in candidates]
+				for fut in as_completed(futures):
+					try:
+						res = fut.result()
+						if res:
+							matches.append(res)
+					except Exception:
+						# ignore individual failures
+						continue
 
 		try:
 			if created_tmp and user_wav_path and os.path.exists(user_wav_path):
@@ -1265,42 +1310,19 @@ async def api_analyze_vocab(
 				pass
 			return _default_compare_response("Feature extraction failed")
 
-		# Compare against filtered set
+		# Compare against filtered set in parallel
 		matches = []
-		for s_id, meta, ref_path in filtered:
-			try:
-				ref_features = helpers.extract_features(ref_path)
-				mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
-				mfcc_score = max(0, 100 - mfcc_dist * 2)
-				pitch_score = max(0, 100 - pitch_diff * 0.5)
-				tempo_score = max(0, 100 - tempo_diff * 0.5)
-				overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
-
-				vocab_info = _get_vocab_info(s_id, meta)
-
-				matches.append({
-					"sample_id": s_id,
-					"filename": meta.get("filename"),
-					"lesson_id": meta.get("lesson_id"),
-					"vocab_id": meta.get("vocab_id"),
-					"word": vocab_info.get("word", "Unknown"),
-					"meaning": vocab_info.get("meaning", ""),
-					"overall_score": round(overall_score, 2),
-					"scores": {
-						"mfcc": round(mfcc_score, 2),
-						"pitch": round(pitch_score, 2),
-						"tempo": round(tempo_score, 2)
-					},
-					"details": {
-						"mfcc_distance": round(mfcc_dist, 4),
-						"pitch_difference_hz": round(pitch_diff, 2),
-						"tempo_difference_bpm": round(tempo_diff, 2)
-					}
-					,"comment": _get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff)
-				})
-			except Exception as e:
-				helpers.logger.warning(f"Skipped sample {s_id}: {e}")
-				continue
+		if filtered:
+			max_workers = min(6, len(filtered))
+			with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
+				futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, user_features) for (s_id, meta, ref_path) in filtered]
+				for fut in as_completed(futures):
+					try:
+						res = fut.result()
+						if res:
+							matches.append(res)
+					except Exception:
+						continue
 
 		try:
 			if created_tmp and user_wav_path and os.path.exists(user_wav_path):
