@@ -914,53 +914,41 @@ def _get_feedback(score: float) -> str:
 
 
 def _get_review(score: float, mfcc_dist: Optional[float] = None, pitch_diff: Optional[float] = None, tempo_diff: Optional[float] = None) -> str:
-	"""Generate a detailed bilingual (VN/EN) technical review including numeric metrics and actionable tips.
+	"""Return a short Vietnamese comment (concise, actionable).
 
-	Produces a multi-clause string describing overall level, component issues (MFCC ~ pronunciation quality, pitch difference in Hz, tempo difference in BPM),
-	and concrete exercises to improve. Intended for C (detailed) mode.
+	Examples: "Xuất sắc — phát âm gần mẫu. Gợi ý: chú ý âm cuối." 
 	"""
-	lines = []
-	# Overall
+	# Short overall label
 	if score >= 90:
-		lines.append(f"Rất tốt (Overall: {score:.1f}). Your pronunciation closely matches the reference.")
+		base = "Xuất sắc — phát âm rất giống mẫu."
 	elif score >= 75:
-		lines.append(f"Tốt (Overall: {score:.1f}). Good match with minor issues to address.")
+		base = "Tốt — gần đúng, chỉnh nhẹ vài âm."
 	elif score >= 60:
-		lines.append(f"Khá (Overall: {score:.1f}). Noticeable differences — focus practice on specific sounds.")
+		base = "Khá — còn lỗi ở vài âm, luyện lại." 
 	elif score >= 40:
-		lines.append(f"Cần cải thiện (Overall: {score:.1f}). Clear mismatches; work on articulation and prosody.")
+		base = "Cần cải thiện — luyện phát âm và ngữ điệu." 
 	else:
-		lines.append(f"Cần luyện tập nhiều (Overall: {score:.1f}). Start from slow repetition and mimicry exercises.")
+		base = "Cần luyện nhiều — bắt đầu từ chậm và nhại mẫu."
 
-	# MFCC / pronunciation quality
+	parts = [base]
+
+	# Brief component hints
 	if mfcc_dist is not None:
-		lines.append(f"Pronunciation distance (MFCC): {mfcc_dist:.2f} — lower is better.")
 		if mfcc_dist > 40:
-			lines.append("Recommendation: isolate consonants and vowel endings; practice minimal pairs and slow repetition.")
+			parts.append("Âm: chưa giống; luyện âm chính và âm cuối.")
 		elif mfcc_dist > 15:
-			lines.append("Recommendation: repeat problematic syllables and compare spectrograms or waveform to the sample.")
+			parts.append("Âm: một số âm cần sửa.")
 
-	# Pitch / intonation
 	if pitch_diff is not None:
-		lines.append(f"Pitch difference: {pitch_diff:.2f} Hz.")
-		if pitch_diff > 40:
-			lines.append("Tip: practice pitch contour — record rising/falling intonation and match the sample.")
-		elif pitch_diff > 10:
-			lines.append("Tip: focus on stress and slight pitch adjustments to match natural prosody.")
+		if pitch_diff > 20:
+			parts.append("Ngữ điệu: lệch, bắt chước cao độ mẫu.")
 
-	# Tempo / speed
 	if tempo_diff is not None:
-		lines.append(f"Tempo difference: {tempo_diff:.2f} BPM.")
-		if tempo_diff > 20:
-			lines.append("Tip: slow down or speed up to match sample rhythm; clap or tap the syllable beats.")
-		elif tempo_diff > 5:
-			lines.append("Tip: adjust speaking rate to better align with sample phrasing.")
+		if tempo_diff > 10:
+			parts.append("Tốc độ: điều chỉnh để khớp nhịp mẫu.")
 
-	# Closing practical exercise
-	lines.append("Practice: listen–imitate–record cycles (3x), focus 5–10s segments, and compare waveforms or pitch traces.")
-
-	# Join as a single paragraph
-	return " ".join(lines)
+	# Join short pieces
+	return " ".join(parts)
 
 
 def _get_default_sample_path() -> Optional[str]:
