@@ -21,7 +21,7 @@ CHUNK_SIZE = 1024 * 1024  # 1MB
 
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 # Background executor for light async processing
@@ -902,14 +902,16 @@ async def api_analyze(
 
 		matches = []
 		if candidates:
-			for (s_id, meta, ref_path) in candidates:
-				try:
-					res = _build_match_entry(s_id, meta, ref_path, user_features)
-					if res:
-						matches.append(res)
-				except Exception:
-					# ignore individual failures
-					continue
+			max_workers = min(8, len(candidates))
+			with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
+				futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, user_features) for (s_id, meta, ref_path) in candidates]
+				for fut in as_completed(futures):
+					try:
+						res = fut.result()
+						if res:
+							matches.append(res)
+					except Exception:
+						continue
 
 		try:
 			if created_tmp and user_wav_path and os.path.exists(user_wav_path):
@@ -1127,28 +1129,32 @@ async def api_analyze_auto(
 			pass
 		raise HTTPException(status_code=404, detail="No reference samples found. Please upload sample audios first.")
 	
-	# Compare with all samples sequentially
+	# Compare with all samples in parallel to speed up detection
 	matches = []
+	candidates = []
 	for sample_id, meta in samples_meta.items():
-		# Filter by lesson_id if provided
 		if lesson_id and meta.get("lesson_id") != lesson_id:
 			continue
-
 		ref_filename = meta.get("filename")
 		if not ref_filename:
 			continue
 		ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
-
 		if not os.path.exists(ref_path):
 			continue
+		candidates.append((sample_id, meta, ref_path))
 
-		try:
-			res = _build_match_entry(sample_id, meta, ref_path, user_features)
-			if res:
-				matches.append(res)
-		except Exception as e:
-			helpers.logger.warning(f"Skipped sample {sample_id}: {e}")
-			continue
+	if candidates:
+		max_workers = min(8, len(candidates))
+		with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
+			futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, user_features) for (s_id, meta, ref_path) in candidates]
+			for fut in as_completed(futures):
+				try:
+					res = fut.result()
+					if res:
+						matches.append(res)
+				except Exception as e:
+					helpers.logger.warning(f"Skipped candidate: {e}")
+					continue
 	
 	# Cleanup user audio if it was a created temp file
 	try:
@@ -1277,16 +1283,19 @@ async def api_analyze_vocab(
 				pass
 			return _default_compare_response("Feature extraction failed")
 
-		# Compare against filtered set sequentially
+		# Compare against filtered set in parallel for speed
 		matches = []
 		if filtered:
-			for (s_id, meta, ref_path) in filtered:
-				try:
-					res = _build_match_entry(s_id, meta, ref_path, user_features)
-					if res:
-						matches.append(res)
-				except Exception:
-					continue
+			max_workers = min(8, len(filtered))
+			with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
+				futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, user_features) for (s_id, meta, ref_path) in filtered]
+				for fut in as_completed(futures):
+					try:
+						res = fut.result()
+						if res:
+							matches.append(res)
+					except Exception:
+						continue
 
 		try:
 			if created_tmp and user_wav_path and os.path.exists(user_wav_path):
