@@ -21,11 +21,12 @@ CHUNK_SIZE = 1024 * 1024  # 1MB
 
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import threading
 
 # Background executor for light async processing
-executor = ThreadPoolExecutor(max_workers=8)
+_default_workers = max(4, (os.cpu_count() or 4))
+executor = ThreadPoolExecutor(max_workers=max(8, _default_workers))
 
 # In-memory cache for extracted sample features to avoid repeated costly extraction
 SAMPLE_FEATURES: dict = {}
@@ -47,6 +48,57 @@ def _get_cached_features(path: str):
 	with SAMPLE_FEATURES_LOCK:
 		SAMPLE_FEATURES[key] = feats
 	return feats
+
+
+def _warm_sample_cache_blocking(paths: list[str]):
+	"""Extract features for given paths in parallel using a process pool (blocking)."""
+	results = {}
+	try:
+		with ProcessPoolExecutor(max_workers=max(2, (os.cpu_count() or 2))) as pexec:
+			futures = {pexec.submit(helpers.extract_features, p): p for p in paths}
+			for fut in as_completed(futures):
+				p = futures[fut]
+				try:
+					feats = fut.result()
+					if feats is not None:
+						results[os.path.abspath(p)] = feats
+				except Exception:
+					continue
+	except Exception:
+		# fallback: sequential
+		for p in paths:
+			try:
+				feats = helpers.extract_features(p)
+				if feats is not None:
+					results[os.path.abspath(p)] = feats
+			except Exception:
+				continue
+
+	# merge into SAMPLE_FEATURES
+	with SAMPLE_FEATURES_LOCK:
+		SAMPLE_FEATURES.update(results)
+
+
+def warm_sample_cache_background():
+	"""Submit cache warming job to background executor (non-blocking)."""
+	try:
+		helpers.load_persisted_store()
+		samples = helpers.PERSISTED_STORE.get("samples", {})
+		paths = []
+		for meta in samples.values():
+			fn = meta.get("filename")
+			if not fn:
+				continue
+			p = os.path.join(helpers.SAMPLES_DIR, fn)
+			if os.path.exists(p):
+				paths.append(p)
+		if not paths:
+			return False
+		# run blocking warm in background executor
+		executor.submit(_warm_sample_cache_blocking, paths)
+		return True
+	except Exception:
+		return False
 
 
 def _build_match_entry(sample_id: str, meta: dict, ref_path: str, user_features: dict):
@@ -403,6 +455,11 @@ async def api_upload_simple(file: UploadFile = File(...), lesson_id: Optional[st
 @router.post("/samples/rescan", summary="Rescan samples directory and auto-register new files")
 def api_samples_rescan():
 	report = helpers.rescan_samples()
+	# After rescan, start warming the feature cache in background
+	try:
+		warm_sample_cache_background()
+	except Exception:
+		pass
 	return {"ok": True, "report": report}
 
 
@@ -463,6 +520,16 @@ def api_samples_link(sample_id: str = Form(...), lesson_id: Optional[str] = Form
 
 	# Persist changes
 	helpers.save_persisted_store()
+
+	# Warm cache for this sample asynchronously
+	try:
+		sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
+		if sample_meta and sample_meta.get("filename"):
+			p = os.path.join(helpers.SAMPLES_DIR, sample_meta.get("filename"))
+			if os.path.exists(p):
+				executor.submit(lambda path: SAMPLE_FEATURES.update({os.path.abspath(path): helpers.extract_features(path)}), p)
+	except Exception:
+		pass
 
 	# Build response objects
 	vocab_obj = None
