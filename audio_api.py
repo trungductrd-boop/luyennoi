@@ -820,7 +820,11 @@ async def api_analyze_compare(
 async def api_analyze(
 	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
 	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
-	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)")
+	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)"),
+	mode: Optional[str] = Form(None, description="Optional mode: 'vocab' to run vocab-specific analysis"),
+	vocab_id: Optional[str] = Form(None, description="Vocab id when mode='vocab'"),
+	word: Optional[str] = Form(None, description="Optional target word text"),
+	timeout: Optional[int] = Form(120, description="Timeout seconds for processing (default 120)"),
 ):
 	"""
 	Compatibility endpoint that either compares uploaded user audio against a
@@ -887,6 +891,15 @@ async def api_analyze(
 					return _default_compare_response("Audio conversion failed")
 
 		# If sample_id provided -> compare with that sample
+
+		# Special mode: vocab -> run vocab-specific analysis (forced-alignment / ASR focused)
+		if mode == "vocab":
+			# ensure file present
+			if not user_wav_path:
+				return _default_compare_response("No user audio provided for vocab mode")
+			# delegate to handler which will clean up temp file as needed
+			return _handle_vocab_mode(user_wav_path, vocab_id=vocab_id, word=word, timeout=timeout, created_tmp=created_tmp)
+
 		if sample_id:
 			helpers.load_persisted_store()
 			sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
@@ -1109,6 +1122,138 @@ def _default_auto_response(message: str = "No analysis available") -> dict:
 		"best_match": None,
 		"all_matches": []
 	}
+
+
+def _handle_vocab_mode(user_wav_path: str, vocab_id: Optional[str], word: Optional[str], timeout: int, created_tmp: bool):
+	"""Handle specialized vocab analysis.
+
+	Attempts forced alignment with a reference sample if available via helpers.forced_align.
+	Falls back to helpers.asr_transcribe (if present) + token match, or to feature-compare.
+	Returns a JSON-serializable dict as described in the spec.
+	"""
+	start_t = time.time()
+
+	# validate vocab_id
+	try:
+		helpers.load_persisted_store()
+	except Exception:
+		pass
+
+	# Find reference sample for vocab_id in persisted store or built-in VOCAB
+	ref_path = None
+	if vocab_id:
+		samp = None
+		for sid, meta in helpers.PERSISTED_STORE.get("samples", {}).items():
+			if meta.get("vocab_id") == vocab_id:
+				fn = meta.get("filename")
+				if fn:
+					p = os.path.join(helpers.SAMPLES_DIR, fn)
+					if os.path.exists(p):
+						ref_path = p
+						samp = sid
+						break
+		# fallback: try to find audio filename stored on vocab entries
+		if not ref_path:
+			lessons = helpers.PERSISTED_STORE.get("lessons", {})
+			for bucket, entries in lessons.items():
+				for v in entries:
+					if v.get("id") == vocab_id and v.get("audio_filename"):
+						p = os.path.join(helpers.SAMPLES_DIR, v.get("audio_filename"))
+						if os.path.exists(p):
+							ref_path = p
+							break
+
+	# If no vocab_id or invalid, return error
+	if mode := ("vocab" if vocab_id else None):
+		if not vocab_id or (vocab_id and not ref_path and vocab_id not in helpers.VOCAB and vocab_id not in [v.get("id") for bucket in helpers.PERSISTED_STORE.get("lessons", {}).values() for v in bucket]):
+			# still allow ASR-only attempt if no ref but vocab_id provided
+			pass
+
+	# define worker job
+	def job():
+		result = {"success": False}
+
+		# 1) If forced_align helper exists and we have a reference, prefer it
+		if ref_path and hasattr(helpers, "forced_align"):
+			try:
+				out = helpers.forced_align(user_wav_path, ref_path, target_word=word or vocab_id)
+				# expected out: {transcript, score, timings}
+				result = {
+					"success": True,
+					"predict": out.get("transcript") if out else None,
+					"transcript": out.get("transcript") if out else None,
+					"score": out.get("score") if out and out.get("score") is not None else None,
+					"score_detail": out.get("score_detail") if out else None,
+					"advice": out.get("advice") if out else "",
+					"timings": out.get("timings") if out else None
+				}
+				return result
+			except Exception:
+				pass
+
+		# 2) Try ASR transcription if available
+		if hasattr(helpers, "asr_transcribe"):
+			try:
+				transcript = helpers.asr_transcribe(user_wav_path)
+				# simple matching: check whether target token appears
+				score = None
+				if (word or vocab_id) and transcript:
+					target = (word or vocab_id).lower()
+					match = target in transcript.lower()
+					score = 1.0 if match else 0.0
+				result = {
+					"success": True,
+					"predict": transcript,
+					"transcript": transcript,
+					"score": score,
+					"advice": ("Tốt" if score == 1.0 else "Cần luyện lại: nghe mẫu và thử lại."),
+				}
+				return result
+			except Exception:
+				pass
+
+		# 3) Fallback: feature-compare against ref if available
+		if ref_path:
+			try:
+				user_feats = helpers.extract_features(user_wav_path)
+				ref_feats = _get_cached_features(ref_path) or helpers.extract_features(ref_path)
+				mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_feats, ref_feats)
+				# normalize to 0..1
+				mfcc_score = max(0.0, min(1.0, 1.0 - (mfcc_dist / 100.0)))
+				overall = (mfcc_score * 0.7)
+				return {
+					"success": True,
+					"predict": None,
+					"transcript": None,
+					"score": round(overall, 3),
+					"score_detail": {"mfcc_distance": mfcc_dist, "pitch_diff": pitch_diff, "tempo_diff": tempo_diff},
+					"advice": _get_feedback(overall * 100)
+				}
+			except Exception:
+				pass
+
+		return {"success": False, "message": "Could not analyze vocab with available methods"}
+
+	# run job with timeout
+	try:
+		with ThreadPoolExecutor(max_workers=1) as exec2:
+			fut = exec2.submit(job)
+			res = fut.result(timeout=max(5, int(timeout)))
+	except Exception as e:
+		res = {"success": False, "message": f"Processing error or timeout: {e}"}
+
+	# cleanup temp
+	try:
+		if created_tmp and user_wav_path and os.path.exists(user_wav_path):
+			os.remove(user_wav_path)
+	except Exception:
+		pass
+
+	# add small audit/log fields
+	res.setdefault("vocab_id", vocab_id)
+	res.setdefault("word", word)
+	res.setdefault("elapsed_ms", int((time.time() - start_t) * 1000))
+	return res
 
 @router.post("/analyze/auto", summary="Auto-detect and analyze user pronunciation")
 async def api_analyze_auto(
