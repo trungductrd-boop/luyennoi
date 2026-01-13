@@ -140,8 +140,19 @@ def convert_to_wav16_mono(src_path: str, dst_path: str) -> None:
         result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         logger.info(f"Converted {src_path} to {dst_path}")
     except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg conversion failed: {e.stderr.decode()}")
-        raise RuntimeError(f"Audio conversion failed: {e.stderr.decode()}")
+        stderr_text = e.stderr.decode() if e and getattr(e, 'stderr', None) else str(e)
+        logger.error(f"FFmpeg conversion failed: {stderr_text}")
+        # write stderr to a temp log for easier debugging from API
+        try:
+            os.makedirs(TMP_DIR, exist_ok=True)
+            stamp = int(time.time() * 1000)
+            err_path = os.path.join(TMP_DIR, f"ffmpeg_convert_error_{stamp}.log")
+            with open(err_path, "w", encoding="utf-8") as ef:
+                ef.write(stderr_text)
+            logger.info(f"Wrote ffmpeg stderr to {err_path}")
+        except Exception:
+            pass
+        raise RuntimeError(f"Audio conversion failed: {stderr_text}")
     except FileNotFoundError:
         logger.error("FFmpeg not found. Please install ffmpeg and add to PATH")
         raise RuntimeError("FFmpeg not installed")

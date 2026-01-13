@@ -33,6 +33,105 @@ SAMPLE_FEATURES: dict = {}
 SAMPLE_FEATURES_LOCK = threading.Lock()
 
 
+def _ensure_wav16_mono(path: str):
+	"""Return a path to a 16k mono WAV. If input already is 16k mono WAV, return original.
+	Otherwise convert via helpers.convert_to_wav16_mono into TMP_DIR and return new path.
+	Returns (use_path, created_tmp_bool)
+	"""
+	try:
+		if not path:
+			return (None, False)
+		if path.lower().endswith('.wav'):
+			try:
+				with _wave.open(path, 'rb') as wf:
+					channels = wf.getnchannels()
+					sr = wf.getframerate()
+				if channels == 1 and sr == 16000:
+					return (path, False)
+			except Exception:
+				pass
+		# need conversion
+		os.makedirs(helpers.TMP_DIR, exist_ok=True)
+		tmp_name = f"conv_{uuid.uuid4().hex[:8]}.wav"
+		tmp_path = os.path.join(helpers.TMP_DIR, tmp_name)
+		try:
+			helpers.convert_to_wav16_mono(path, tmp_path)
+			return (tmp_path, True)
+		except Exception:
+			# last resort: return original
+			return (path, False)
+	except Exception:
+		return (path, False)
+
+
+def _extract_features_safe(path: str, log_context: Optional[str] = None):
+	"""Wrap helpers.extract_features with conversion, logging, timing and basic guards.
+
+	Returns features dict or raises Exception on fatal failure.
+	"""
+	ctx = f"[{log_context}]" if log_context else "[extract_features]"
+	if not path:
+		raise ValueError("no path provided to extract features")
+
+	start_total = time.time()
+	use_path, created_tmp = _ensure_wav16_mono(path)
+	try:
+		size = os.path.getsize(use_path) if use_path and os.path.exists(use_path) else 0
+	except Exception:
+		size = 0
+
+	helpers.logger.info(f"{ctx} extracting features from {use_path} size={size}") if hasattr(helpers, 'logger') else print(f"{ctx} extracting {use_path}")
+
+	start = time.time()
+	try:
+		feats = helpers.extract_features(use_path)
+	except Exception as e:
+		helpers.logger.error(f"{ctx} extract_features error for {use_path}: {e}") if hasattr(helpers, 'logger') else print(f"{ctx} extract error: {e}")
+		# cleanup temp file if we created one during conversion
+		if created_tmp:
+			try:
+				os.remove(use_path)
+			except Exception:
+				pass
+		raise
+	elapsed = time.time() - start
+
+	# basic validation
+	if not feats or (isinstance(feats, dict) and len(feats) == 0):
+		helpers.logger.error(f"{ctx} extracted empty features from {use_path}") if hasattr(helpers, 'logger') else print(f"{ctx} empty feats")
+		if created_tmp:
+			try:
+				os.remove(use_path)
+			except Exception:
+				pass
+		raise ValueError("empty features")
+
+	# optional MFCC shape logging if available
+	try:
+		mfcc = feats.get('mfcc') if isinstance(feats, dict) else None
+		if mfcc is not None:
+			try:
+				import numpy as _np
+				m = _np.array(mfcc)
+				helpers.logger.info(f"{ctx} mfcc shape={m.shape} nan_count={_np.isnan(m).sum()}") if hasattr(helpers, 'logger') else print(f"{ctx} mfcc shape={m.shape}")
+			except Exception:
+				pass
+	except Exception:
+		pass
+
+	total_elapsed = time.time() - start_total
+	helpers.logger.info(f"{ctx} extraction done elapsed={total_elapsed:.3f}s (mfcc_time={elapsed:.3f}s) size={size}") if hasattr(helpers, 'logger') else print(f"{ctx} done {total_elapsed:.3f}s")
+
+	# cleanup tmp if created
+	if created_tmp:
+		try:
+			os.remove(use_path)
+		except Exception:
+			pass
+
+	return feats
+
+
 def _get_cached_features(path: str):
 	"""Return cached features for `path` or extract and cache them. Returns None on failure."""
 	if not path:
@@ -1156,7 +1255,11 @@ def _handle_vocab_mode(user_wav_path: str, vocab_id: Optional[str], word: Option
 		if not ref_path:
 			lessons = helpers.PERSISTED_STORE.get("lessons", {})
 			for bucket, entries in lessons.items():
-				for v in entries:
+				# persisted store may hold vocab lists as lists or dicts (id->obj)
+				iter_entries = entries.values() if isinstance(entries, dict) else entries
+				for v in iter_entries:
+					if not isinstance(v, dict):
+						continue
 					if v.get("id") == vocab_id and v.get("audio_filename"):
 						p = os.path.join(helpers.SAMPLES_DIR, v.get("audio_filename"))
 						if os.path.exists(p):
@@ -1165,7 +1268,18 @@ def _handle_vocab_mode(user_wav_path: str, vocab_id: Optional[str], word: Option
 
 	# If no vocab_id or invalid, return error
 	if mode := ("vocab" if vocab_id else None):
-		if not vocab_id or (vocab_id and not ref_path and vocab_id not in helpers.VOCAB and vocab_id not in [v.get("id") for bucket in helpers.PERSISTED_STORE.get("lessons", {}).values() for v in bucket]):
+		# build set of persisted vocab ids (handle lists or dicts in persisted lessons)
+		persisted_vocab_ids = set()
+		for bucket in helpers.PERSISTED_STORE.get("lessons", {}).values():
+			if isinstance(bucket, dict):
+				iterable = bucket.values()
+			else:
+				iterable = bucket
+			for v in iterable:
+				if isinstance(v, dict) and v.get("id"):
+					persisted_vocab_ids.add(v.get("id"))
+
+		if not vocab_id or (vocab_id and not ref_path and vocab_id not in helpers.VOCAB and vocab_id not in persisted_vocab_ids):
 			# still allow ASR-only attempt if no ref but vocab_id provided
 			pass
 
@@ -1176,6 +1290,7 @@ def _handle_vocab_mode(user_wav_path: str, vocab_id: Optional[str], word: Option
 		# 1) If forced_align helper exists and we have a reference, prefer it
 		if ref_path and hasattr(helpers, "forced_align"):
 			try:
+				helpers.logger.info(f"_handle_vocab_mode: attempting forced_align ref={ref_path}")
 				out = helpers.forced_align(user_wav_path, ref_path, target_word=word or vocab_id)
 				# expected out: {transcript, score, timings}
 				result = {
@@ -1187,14 +1302,23 @@ def _handle_vocab_mode(user_wav_path: str, vocab_id: Optional[str], word: Option
 					"advice": out.get("advice") if out else "",
 					"timings": out.get("timings") if out else None
 				}
+				helpers.logger.info(f"_handle_vocab_mode: forced_align succeeded: score={result.get('score')}")
 				return result
-			except Exception:
-				pass
+			except Exception as e:
+				helpers.logger.error(f"_handle_vocab_mode: forced_align error: {e}")
+				try:
+					os.makedirs(helpers.TMP_DIR, exist_ok=True)
+					with open(os.path.join(helpers.TMP_DIR, f"vocab_forced_align_err_{int(time.time()*1000)}.log"), "w", encoding="utf-8") as ef:
+						ef.write(str(e))
+				except Exception:
+					pass
 
 		# 2) Try ASR transcription if available
 		if hasattr(helpers, "asr_transcribe"):
 			try:
+				helpers.logger.info("_handle_vocab_mode: attempting asr_transcribe")
 				transcript = helpers.asr_transcribe(user_wav_path)
+				helpers.logger.info(f"_handle_vocab_mode: asr_transcribe result: {transcript}")
 				# simple matching: check whether target token appears
 				score = None
 				if (word or vocab_id) and transcript:
@@ -1209,18 +1333,25 @@ def _handle_vocab_mode(user_wav_path: str, vocab_id: Optional[str], word: Option
 					"advice": ("Tốt" if score == 1.0 else "Cần luyện lại: nghe mẫu và thử lại."),
 				}
 				return result
-			except Exception:
-				pass
+			except Exception as e:
+				helpers.logger.error(f"_handle_vocab_mode: asr_transcribe error: {e}")
+				try:
+					with open(os.path.join(helpers.TMP_DIR, f"vocab_asr_err_{int(time.time()*1000)}.log"), "w", encoding="utf-8") as ef:
+						ef.write(str(e))
+				except Exception:
+					pass
 
 		# 3) Fallback: feature-compare against ref if available
 		if ref_path:
 			try:
+				helpers.logger.info(f"_handle_vocab_mode: attempting feature-compare against {ref_path}")
 				user_feats = helpers.extract_features(user_wav_path)
 				ref_feats = _get_cached_features(ref_path) or helpers.extract_features(ref_path)
 				mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_feats, ref_feats)
 				# normalize to 0..1
 				mfcc_score = max(0.0, min(1.0, 1.0 - (mfcc_dist / 100.0)))
 				overall = (mfcc_score * 0.7)
+				helpers.logger.info(f"_handle_vocab_mode: feature-compare mfcc_dist={mfcc_dist} overall={overall}")
 				return {
 					"success": True,
 					"predict": None,
@@ -1229,8 +1360,13 @@ def _handle_vocab_mode(user_wav_path: str, vocab_id: Optional[str], word: Option
 					"score_detail": {"mfcc_distance": mfcc_dist, "pitch_diff": pitch_diff, "tempo_diff": tempo_diff},
 					"advice": _get_feedback(overall * 100)
 				}
-			except Exception:
-				pass
+			except Exception as e:
+				helpers.logger.error(f"_handle_vocab_mode: feature-compare error: {e}")
+				try:
+					with open(os.path.join(helpers.TMP_DIR, f"vocab_feat_err_{int(time.time()*1000)}.log"), "w", encoding="utf-8") as ef:
+						ef.write(str(e))
+				except Exception:
+					pass
 
 		return {"success": False, "message": "Could not analyze vocab with available methods"}
 
