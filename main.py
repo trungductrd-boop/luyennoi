@@ -86,7 +86,13 @@ def safe_filename(name: Optional[str]) -> str:
 @app.on_event("startup")
 async def startup_event():
     """Initialize on startup"""
+    # Load persisted store and rescan samples once during application startup
     helpers.load_persisted_store()
+    try:
+        startup_report = helpers.rescan_samples()
+        helpers.logger.info(f"Startup rescan report: {startup_report}")
+    except Exception:
+        pass
     helpers.logger.info("Server started successfully")
     try:
         # Kick off background warming of sample feature cache to reduce analysis latency
@@ -129,13 +135,8 @@ def whoami():
     return {"ip": get_local_ip(), "port": 8000}
 
 
-# perform initial load + rescan at startup
-helpers.load_persisted_store()
-try:
-    startup_report = helpers.rescan_samples()
-    print("startup rescan report:", startup_report)
-except Exception as e:
-    print("startup rescan failed:", e)
+# Note: initial load + rescan moved into the FastAPI startup event to avoid
+# duplicate work during module import and when uvicorn spawns/reloads workers.
 
 # -------------------------
 # Comparison endpoints (keep in main)

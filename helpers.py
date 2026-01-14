@@ -73,6 +73,9 @@ VOCAB = {
 # persisted store (file-backed)
 PERSISTED_STORE = {"lessons": {}, "samples": {}}
 
+# Internal flag: track whether the persisted store has been loaded at least once
+_PERSISTED_STORE_LOADED = False
+
 # Setup logging with better format
 logging.basicConfig(
     level=logging.INFO,
@@ -82,11 +85,16 @@ logger = logging.getLogger(__name__)
 
 def load_persisted_store():
     global PERSISTED_STORE
+    global _PERSISTED_STORE_LOADED
     try:
         with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
             PERSISTED_STORE = json.load(f)
-        # Avoid noisy repeated INFO logs during startup; use DEBUG for routine loads
-        logger.debug(f"Loaded persisted store: {len(PERSISTED_STORE.get('samples', {}))} samples")
+        # Log at INFO only the first time, subsequent loads are routine and logged at DEBUG
+        if not _PERSISTED_STORE_LOADED:
+            logger.info(f"Loaded persisted store: {len(PERSISTED_STORE.get('samples', {}))} samples")
+            _PERSISTED_STORE_LOADED = True
+        else:
+            logger.debug(f"Loaded persisted store (again): {len(PERSISTED_STORE.get('samples', {}))} samples")
         
         # Load progress back into LESSONS
         progress_data = PERSISTED_STORE.get("progress", {})
