@@ -12,3 +12,6 @@ numba==0.58.1
 
 # Optional: libmagic-based file type detection (requires system lib on some platforms)
 python-magic
+
+# Cross-process file locking for leader election (prevent multiple workers doing rescan/save)
+portalocker

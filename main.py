@@ -13,6 +13,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
+try:
+    import portalocker
+except Exception:
+    portalocker = None
 
 # import shared helpers and router
 # Local imports so `uvicorn main:app` works on deploy
@@ -86,13 +90,42 @@ def safe_filename(name: Optional[str]) -> str:
 @app.on_event("startup")
 async def startup_event():
     """Initialize on startup"""
-    # Load persisted store and rescan samples once during application startup
+    # Load persisted store in all workers so in-memory data is available
     helpers.load_persisted_store()
-    try:
-        startup_report = helpers.rescan_samples()
-        helpers.logger.info(f"Startup rescan report: {startup_report}")
-    except Exception:
-        pass
+
+    # Attempt to become the leader to run rescan/save (non-blocking lock)
+    leader_lock_path = helpers.VOCAB_STORE_FILE + ".leader.lock"
+    if portalocker:
+        # ensure lock dir exists
+        try:
+            os.makedirs(os.path.dirname(leader_lock_path) or ".", exist_ok=True)
+            open(leader_lock_path, "a").close()
+        except Exception:
+            pass
+        try:
+            with open(leader_lock_path, "r+") as lf:
+                portalocker.lock(lf, portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING)
+                try:
+                    helpers.logger.info("Acquired leader lock; performing startup rescan/save (pid=%d)", os.getpid())
+                    startup_report = helpers.rescan_samples()
+                    helpers.logger.info(f"Startup rescan report: {startup_report}")
+                finally:
+                    try:
+                        portalocker.unlock(lf)
+                    except Exception:
+                        pass
+        except portalocker.exceptions.LockException:
+            helpers.logger.info("Leader lock not acquired; skipping rescan/save in this worker (pid=%d)", os.getpid())
+        except Exception as e:
+            helpers.logger.warning(f"Leader lock attempt failed: {e}")
+    else:
+        # portalocker not available: fallback to single-process behaviour (may duplicate work)
+        try:
+            helpers.logger.warning("portalocker not installed; performing rescan in startup (may run in multiple workers)")
+            startup_report = helpers.rescan_samples()
+            helpers.logger.info(f"Startup rescan report: {startup_report}")
+        except Exception:
+            pass
     helpers.logger.info("Server started successfully")
     try:
         # Kick off background warming of sample feature cache to reduce analysis latency

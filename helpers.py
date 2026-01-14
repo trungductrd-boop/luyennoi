@@ -10,12 +10,20 @@ import librosa
 import numpy as np
 import logging
 
+# Optional: portalocker for cross-process file locking
+try:
+    import portalocker
+except Exception:
+    portalocker = None
+
 # --- Configuration ---
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
 SAMPLES_DIR = "data/samples"
 USERS_DIR = "data/users"
 STATIC_DIR = "data"
-VOCAB_STORE_FILE = "data/vocab_store.json"
+# Allow overriding persisted store path via env var to keep it outside watched dirs
+PERSIST_PATH = os.environ.get("PERSIST_PATH", "data/vocab_store.json")
+VOCAB_STORE_FILE = PERSIST_PATH
 TMP_DIR = "data/tmp"
 FFMPEG_BIN = "ffmpeg"
 ALLOWED_EXTS = {".wav", ".mp3", ".m4a", ".ogg"}
@@ -26,6 +34,9 @@ os.makedirs(USERS_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(VOCAB_STORE_FILE) or ".", exist_ok=True)
+
+# Lock path used for coordinating readers/writers and leader election
+LOCK_PATH = VOCAB_STORE_FILE + ".lock"
 
 # create empty store if missing
 if not os.path.exists(VOCAB_STORE_FILE):
@@ -87,14 +98,26 @@ def load_persisted_store():
     global PERSISTED_STORE
     global _PERSISTED_STORE_LOADED
     try:
-        with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
-            PERSISTED_STORE = json.load(f)
-        # Log at INFO only the first time, subsequent loads are routine and logged at DEBUG
-        if not _PERSISTED_STORE_LOADED:
-            logger.info(f"Loaded persisted store: {len(PERSISTED_STORE.get('samples', {}))} samples")
-            _PERSISTED_STORE_LOADED = True
+        # If portalocker is available, acquire a shared lock while reading to avoid races
+        if portalocker:
+            # ensure lock file exists
+            open(LOCK_PATH, "a").close()
+            with open(LOCK_PATH, "r+") as lockf:
+                portalocker.lock(lockf, portalocker.LockFlags.SHARED)
+                try:
+                    with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
+                        PERSISTED_STORE = json.load(f)
+                finally:
+                    try:
+                        portalocker.unlock(lockf)
+                    except Exception:
+                        pass
         else:
-            logger.debug(f"Loaded persisted store (again): {len(PERSISTED_STORE.get('samples', {}))} samples")
+            with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
+                PERSISTED_STORE = json.load(f)
+        # Avoid noisy INFO logs from multiple worker processes; use DEBUG for loads
+        logger.debug(f"Loaded persisted store: {len(PERSISTED_STORE.get('samples', {}))} samples (pid={os.getpid()})")
+        _PERSISTED_STORE_LOADED = True
         
         # Load progress back into LESSONS
         progress_data = PERSISTED_STORE.get("progress", {})
@@ -119,9 +142,26 @@ def load_persisted_store():
 
 def save_persisted_store():
     try:
-        with open(VOCAB_STORE_FILE, "w", encoding="utf-8") as f:
-            json.dump(PERSISTED_STORE, f, ensure_ascii=False, indent=2)
-        logger.info("Persisted store saved successfully")
+        # Ensure destination dir exists
+        os.makedirs(os.path.dirname(VOCAB_STORE_FILE) or ".", exist_ok=True)
+        # If portalocker available, acquire exclusive lock while writing
+        if portalocker:
+            # ensure lock file exists
+            open(LOCK_PATH, "a").close()
+            with open(LOCK_PATH, "r+") as lockf:
+                portalocker.lock(lockf, portalocker.LockFlags.EXCLUSIVE)
+                try:
+                    with open(VOCAB_STORE_FILE, "w", encoding="utf-8") as f:
+                        json.dump(PERSISTED_STORE, f, ensure_ascii=False, indent=2)
+                finally:
+                    try:
+                        portalocker.unlock(lockf)
+                    except Exception:
+                        pass
+        else:
+            with open(VOCAB_STORE_FILE, "w", encoding="utf-8") as f:
+                json.dump(PERSISTED_STORE, f, ensure_ascii=False, indent=2)
+        logger.info("Persisted store saved successfully (path=%s)", VOCAB_STORE_FILE)
     except Exception as e:
         logger.error(f"Error saving store: {e}")
         raise
