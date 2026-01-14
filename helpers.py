@@ -123,14 +123,14 @@ def merged_vocab_for_lesson(lesson_id: str):
         for v in VOCAB[lesson_id]:
             fn = v.get("audio_filename")
             v2 = {**v}
-            v2["audio_url"] = f"/static/samples/{fn}" if fn else None
+            v2["audio_url"] = f"/samples/{fn}" if fn else None
             result.append(v2)
     lessons_store = PERSISTED_STORE.get("lessons", {})
     if lesson_id in lessons_store:
         for v in lessons_store[lesson_id]:
             fn = v.get("audio_filename")
             v2 = {**v}
-            v2["audio_url"] = f"/static/samples/{fn}" if fn else None
+            v2["audio_url"] = f"/samples/{fn}" if fn else None
             result.append(v2)
     return result
 

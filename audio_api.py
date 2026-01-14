@@ -298,7 +298,7 @@ def api_list_samples():
 	for fn in sorted(os.listdir(helpers.SAMPLES_DIR)):
 		path = os.path.join(helpers.SAMPLES_DIR, fn)
 		if os.path.isfile(path):
-			files.append({"filename": fn, "audio_url": f"/static/samples/{fn}"})
+			files.append({"filename": fn, "audio_url": f"/samples/{fn}"})
 	return {"count": len(files), "files": files, "rescan_report": report}
 
 @router.post("/samples/upload-simple", summary="Upload sample and register (simple). Returns sample_id and audio_url.")
@@ -335,7 +335,7 @@ async def api_upload_simple(file: UploadFile = File(...), lesson_id: Optional[st
 	helpers.PERSISTED_STORE.setdefault("samples", {})
 	helpers.PERSISTED_STORE["samples"][sample_id] = {"filename": conv_fname, "lesson_id": lesson_id, "vocab_id": vocab_id}
 	helpers.save_persisted_store()
-	audio_url = f"/static/samples/{conv_fname}"
+	audio_url = f"/samples/{conv_fname}"
 	return {"ok": True, "sample_id": sample_id, "audio_filename": conv_fname, "audio_url": audio_url}
 
 @router.post("/samples/rescan", summary="Rescan samples directory and auto-register new files")
@@ -408,7 +408,7 @@ def api_samples_link(sample_id: str = Form(...), lesson_id: Optional[str] = Form
 		bucket = target_lesson or "0"
 		for v in helpers.PERSISTED_STORE.get("lessons", {}).get(bucket, []):
 			if v.get("id") == vocab_id:
-				vocab_obj = {**v, "audio_url": f"/static/samples/{v.get('audio_filename')}" if v.get('audio_filename') else None}
+				vocab_obj = {**v, "audio_url": f"/samples/{v.get('audio_filename')}" if v.get('audio_filename') else None}
 				break
 
 	return {"ok": True, "sample_id": sample_id, "sample": sample, "vocab": vocab_obj}
@@ -510,7 +510,7 @@ def api_add_vocab(lesson_id: str, item: VocabItemIn):
 	}
 	lessons_store[lesson_id].append(vocab_obj)
 	helpers.save_persisted_store()
-	vocab_with_url = {**vocab_obj, "audio_url": f"/static/samples/{audio_filename}" if audio_filename else None}
+	vocab_with_url = {**vocab_obj, "audio_url": f"/samples/{audio_filename}" if audio_filename else None}
 	return {"ok": True, "vocab": vocab_with_url}
 
 @router.get("/lessons/{lesson_id}/vocab/store", summary="Get persisted vocab for lesson")
@@ -521,7 +521,7 @@ def api_get_vocab_store(lesson_id: str):
 	result = []
 	for v in items:
 		fn = v.get("audio_filename")
-		result.append({**v, "audio_url": f"/static/samples/{fn}" if fn else None})
+		result.append({**v, "audio_url": f"/samples/{fn}" if fn else None})
 	return {"count": len(result), "vocab": result}
 
 # -------------------------
@@ -531,7 +531,8 @@ def api_get_vocab_store(lesson_id: str):
 async def api_analyze_compare(
 	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
 	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
-	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)")
+	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)"),
+	mouth_samples: Optional[str] = Form(None, description="Optional JSON array of mouth snapshots for multimodal fusion")
 ):
 	"""
 	Upload user audio and compare with a reference sample.
@@ -664,7 +665,7 @@ async def api_analyze_compare(
 		except Exception:
 			pass
 
-		return {
+		resp = {
 			"ok": True,
 			"sample_id": sample_id,
 			"reference_file": ref_filename,
@@ -682,6 +683,23 @@ async def api_analyze_compare(
 			"feedback": _get_feedback(overall_score)
 		}
 
+		# Multimodal fusion if mouth snapshots provided and helpers_multimodal available
+		try:
+			if mouth_samples and hasattr(helpers, "helpers_multimodal") and helpers.helpers_multimodal:
+				try:
+					ms = json.loads(mouth_samples)
+				except Exception:
+					ms = None
+				if isinstance(ms, list) and ms:
+					audio_artic = helpers.helpers_multimodal.compute_audio_articulatory_features(user_wav_path)
+					mouth_analysis = helpers.helpers_multimodal.analyze_mouth_series_extended(ms)
+					combined, details = helpers.helpers_multimodal.fuse_multimodal_enhanced(mfcc_dist, pitch_diff, tempo_diff, audio_artic, mouth_analysis)
+					resp["multimodal"] = {"combined_score": round(combined, 4), "details": details}
+		except Exception:
+			pass
+
+		return resp
+
 	except Exception as e:
 		helpers.logger.error(f"Unexpected error in /analyze/compare: {e}")
 		return _default_compare_response("Unexpected error preparing user audio")
@@ -690,7 +708,8 @@ async def api_analyze_compare(
 async def api_analyze(
 	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
 	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
-	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)")
+	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)"),
+	mouth_samples: Optional[str] = Form(None, description="Optional JSON array of mouth snapshots for multimodal fusion")
 ):
 	"""
 	Compatibility endpoint that either compares uploaded user audio against a
@@ -792,7 +811,7 @@ async def api_analyze(
 			except Exception:
 				pass
 
-			return {
+			resp = {
 				"ok": True,
 				"sample_id": sample_id,
 				"reference_file": ref_filename,
@@ -809,6 +828,22 @@ async def api_analyze(
 				},
 				"feedback": _get_feedback(overall_score)
 			}
+
+			try:
+				if mouth_samples and hasattr(helpers, "helpers_multimodal") and helpers.helpers_multimodal:
+					try:
+						ms = json.loads(mouth_samples)
+					except Exception:
+						ms = None
+					if isinstance(ms, list) and ms:
+						audio_artic = helpers.helpers_multimodal.compute_audio_articulatory_features(user_wav_path)
+						mouth_analysis = helpers.helpers_multimodal.analyze_mouth_series_extended(ms)
+						combined, details = helpers.helpers_multimodal.fuse_multimodal_enhanced(mfcc_dist, pitch_diff, tempo_diff, audio_artic, mouth_analysis)
+						resp["multimodal"] = {"combined_score": round(combined, 4), "details": details}
+			except Exception:
+				pass
+
+			return resp
 
 		# Otherwise, auto-detect best matching sample across all samples
 		try:
@@ -878,7 +913,7 @@ async def api_analyze(
 		matches.sort(key=lambda x: x["overall_score"], reverse=True)
 		best_match = matches[0]
 
-		return {
+		resp = {
 			"ok": True,
 			"detected_word": best_match["word"],
 			"best_match": best_match,
@@ -886,6 +921,26 @@ async def api_analyze(
 			"total_compared": len(matches),
 			"feedback": _get_feedback(best_match["overall_score"])
 		}
+
+		try:
+			if mouth_samples and hasattr(helpers, "helpers_multimodal") and helpers.helpers_multimodal:
+				try:
+					ms = json.loads(mouth_samples)
+				except Exception:
+					ms = None
+				if isinstance(ms, list) and ms:
+					ref_path = os.path.join(helpers.SAMPLES_DIR, best_match.get("filename"))
+					if os.path.exists(ref_path):
+						ref_features = helpers.extract_features(ref_path)
+						mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
+						audio_artic = helpers.helpers_multimodal.compute_audio_articulatory_features(user_wav_path)
+						mouth_analysis = helpers.helpers_multimodal.analyze_mouth_series_extended(ms)
+						combined, details = helpers.helpers_multimodal.fuse_multimodal_enhanced(mfcc_dist, pitch_diff, tempo_diff, audio_artic, mouth_analysis)
+						resp["multimodal"] = {"combined_score": round(combined, 4), "details": details}
+		except Exception:
+			pass
+
+		return resp
 	except Exception as e:
 		helpers.logger.error(f"Unexpected error in /analyze: {e}")
 		return _default_compare_response("Unexpected error preparing user audio")
@@ -956,7 +1011,8 @@ def _default_auto_response(message: str = "No analysis available") -> dict:
 async def api_analyze_auto(
 	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
 	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
-	lesson_id: Optional[str] = Form(None, description="Optional: filter by lesson ID")
+	lesson_id: Optional[str] = Form(None, description="Optional: filter by lesson ID"),
+	mouth_samples: Optional[str] = Form(None, description="Optional JSON array of mouth snapshots for multimodal fusion")
 ):
 	"""
 	Upload audio and automatically detect which word the user is pronouncing.
@@ -1104,7 +1160,7 @@ async def api_analyze_auto(
 	matches.sort(key=lambda x: x["overall_score"], reverse=True)
 	best_match = matches[0]
 	
-	return {
+	resp = {
 		"ok": True,
 		"detected_word": best_match["word"],
 		"best_match": best_match,
@@ -1112,6 +1168,26 @@ async def api_analyze_auto(
 		"total_compared": len(matches),
 		"feedback": _get_feedback(best_match["overall_score"])
 	}
+
+	try:
+		if mouth_samples and hasattr(helpers, "helpers_multimodal") and helpers.helpers_multimodal:
+			try:
+				ms = json.loads(mouth_samples)
+			except Exception:
+				ms = None
+			if isinstance(ms, list) and ms:
+				ref_path = os.path.join(helpers.SAMPLES_DIR, best_match.get("filename"))
+				if os.path.exists(ref_path):
+					ref_features = helpers.extract_features(ref_path)
+					mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
+					audio_artic = helpers.helpers_multimodal.compute_audio_articulatory_features(user_wav_path)
+					mouth_analysis = helpers.helpers_multimodal.analyze_mouth_series_extended(ms)
+					combined, details = helpers.helpers_multimodal.fuse_multimodal_enhanced(mfcc_dist, pitch_diff, tempo_diff, audio_artic, mouth_analysis)
+					resp["multimodal"] = {"combined_score": round(combined, 4), "details": details}
+	except Exception:
+		pass
+
+	return resp
 
 
 @router.post("/analyze/vocab", summary="Analyze user audio against a specific vocab's samples")
