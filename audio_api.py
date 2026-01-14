@@ -912,24 +912,11 @@ async def api_analyze_compare(
 		except Exception:
 			pass
 
-		return {
-			"ok": True,
-			"sample_id": sample_id,
-			"reference_file": ref_filename,
-			"scores": {
-				"overall": round(overall_score, 2),
-				"mfcc": round(mfcc_score, 2),
-				"pitch": round(pitch_score, 2),
-				"tempo": round(tempo_score, 2)
-			},
-			"details": {
-				"mfcc_distance": round(mfcc_dist, 4),
-				"pitch_difference_hz": round(pitch_diff, 2),
-				"tempo_difference_bpm": round(tempo_diff, 2)
-			},
-			"feedback": _get_feedback(overall_score),
-			"comment": _get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff)
-		}
+		return _as_review_response(
+			True,
+			comment=_get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff),
+			feedback=_get_feedback(overall_score)
+		)
 
 	except Exception as e:
 		helpers.logger.error(f"Unexpected error in /analyze/compare: {e}")
@@ -1017,7 +1004,21 @@ async def api_analyze(
 			if not user_wav_path:
 				return _default_compare_response("No user audio provided for vocab mode")
 			# delegate to handler which will clean up temp file as needed
-			return _handle_vocab_mode(user_wav_path, vocab_id=vocab_id, word=word, timeout=timeout, created_tmp=created_tmp)
+			res = _handle_vocab_mode(user_wav_path, vocab_id=vocab_id, word=word, timeout=timeout, created_tmp=created_tmp)
+			# Build minimal review-only response
+			comment = res.get("advice") or res.get("transcript") or res.get("predict") or res.get("message")
+			feedback = None
+			if res.get("score") is not None:
+				try:
+					s = float(res.get("score"))
+					# score may be 0..1 or 0..100
+					if 0.0 <= s <= 1.0:
+						feedback = _get_feedback(s * 100)
+					else:
+						feedback = _get_feedback(s)
+				except Exception:
+					feedback = None
+			return _as_review_response(res.get("success", False), comment=comment, feedback=feedback, message=res.get("message"))
 
 		if sample_id:
 			helpers.load_persisted_store()
@@ -1054,24 +1055,11 @@ async def api_analyze(
 			except Exception:
 				pass
 
-			return {
-				"ok": True,
-				"sample_id": sample_id,
-				"reference_file": ref_filename,
-				"scores": {
-					"overall": round(overall_score, 2),
-					"mfcc": round(mfcc_score, 2),
-					"pitch": round(pitch_score, 2),
-					"tempo": round(tempo_score, 2)
-				},
-				"details": {
-					"mfcc_distance": round(mfcc_dist, 4),
-					"pitch_difference_hz": round(pitch_diff, 2),
-					"tempo_difference_bpm": round(tempo_diff, 2)
-				},
-				"feedback": _get_feedback(overall_score),
-				"comment": _get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff)
-			}
+			return _as_review_response(
+				True,
+				comment=_get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff),
+				feedback=_get_feedback(overall_score)
+			)
 
 		# Otherwise, auto-detect best matching sample across all samples
 		# Extract user features via process pool to use multiple cores and avoid blocking
@@ -1157,20 +1145,16 @@ async def api_analyze(
 		matches.sort(key=lambda x: x["overall_score"], reverse=True)
 		best_match = matches[0]
 
-		return {
-			"ok": True,
-			"detected_word": best_match["word"],
-			"best_match": best_match,
-			"all_matches": matches[:5],
-			"total_compared": len(matches),
-			"feedback": _get_feedback(best_match["overall_score"]),
-			"comment": _get_review(
+		return _as_review_response(
+			True,
+			comment=_get_review(
 				best_match["overall_score"],
 				best_match.get("details", {}).get("mfcc_distance"),
 				best_match.get("details", {}).get("pitch_difference_hz"),
 				best_match.get("details", {}).get("tempo_difference_bpm")
-			)
-		}
+			),
+			feedback=_get_feedback(best_match["overall_score"])
+		)
 	except Exception as e:
 		helpers.logger.error(f"Unexpected error in /analyze: {e}")
 		return _default_compare_response("Unexpected error preparing user audio")
@@ -1253,27 +1237,34 @@ def _get_default_sample_path() -> Optional[str]:
 
 
 def _default_compare_response(message: str = "No analysis available") -> dict:
+	# Return minimal error response (no technical fields)
 	return {
 		"ok": False,
-		"message": message,
-		"scores": {
-			"overall": 0.0,
-			"mfcc": 0.0,
-			"pitch": 0.0,
-			"tempo": 0.0
-		},
-		"details": {}
+		"message": message
 	}
 
 
 def _default_auto_response(message: str = "No analysis available") -> dict:
+	# Return minimal error response for auto analysis
 	return {
 		"ok": False,
-		"message": message,
-		"detected_word": None,
-		"best_match": None,
-		"all_matches": []
+		"message": message
 	}
+
+
+def _as_review_response(ok: bool, comment: Optional[str] = None, feedback: Optional[str] = None, message: Optional[str] = None) -> dict:
+	"""Build a minimal review-only response.
+
+	Fields: ok (bool), comment (string), feedback (string, optional), message (string, optional)
+	"""
+	res = {"ok": bool(ok)}
+	# Prefer explicit comment, otherwise use message
+	text = comment if comment is not None else message
+	if text is not None:
+		res["comment"] = text
+	if feedback:
+		res["feedback"] = feedback
+	return res
 
 
 def _handle_vocab_mode(user_wav_path: str, vocab_id: Optional[str], word: Optional[str], timeout: int, created_tmp: bool):
@@ -1571,20 +1562,16 @@ async def api_analyze_auto(
 	matches.sort(key=lambda x: x["overall_score"], reverse=True)
 	best_match = matches[0]
 	
-	return {
-		"ok": True,
-		"detected_word": best_match["word"],
-		"best_match": best_match,
-		"all_matches": matches[:5],  # Top 5 matches
-		"total_compared": len(matches),
-		"feedback": _get_feedback(best_match["overall_score"]),
-		"comment": _get_review(
+	return _as_review_response(
+		True,
+		comment=_get_review(
 			best_match["overall_score"],
 			best_match.get("details", {}).get("mfcc_distance"),
 			best_match.get("details", {}).get("pitch_difference_hz"),
 			best_match.get("details", {}).get("tempo_difference_bpm")
-		)
-	}
+		),
+		feedback=_get_feedback(best_match["overall_score"])
+	)
 
 
 @router.post("/analyze/vocab", summary="Analyze user audio against a specific vocab's samples")
@@ -1710,21 +1697,16 @@ async def api_analyze_vocab(
 		matches.sort(key=lambda x: x["overall_score"], reverse=True)
 		best = matches[0]
 
-		return {
-			"ok": True,
-			"vocab_id": vocab_id,
-			"detected_word": best["word"],
-			"best_match": best,
-			"all_matches": matches[:5],
-			"total_compared": len(matches),
-			"feedback": _get_feedback(best["overall_score"]),
-			"comment": _get_review(
+		return _as_review_response(
+			True,
+			comment=_get_review(
 				best["overall_score"],
 				best.get("details", {}).get("mfcc_distance"),
 				best.get("details", {}).get("pitch_difference_hz"),
 				best.get("details", {}).get("tempo_difference_bpm")
-			) 
-		}
+			),
+			feedback=_get_feedback(best["overall_score"])
+		)
 
 	except Exception as e:
 		helpers.logger.error(f"Unexpected error in /analyze/vocab: {e}")
