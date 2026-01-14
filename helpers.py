@@ -85,7 +85,8 @@ def load_persisted_store():
     try:
         with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
             PERSISTED_STORE = json.load(f)
-        logger.info(f"Loaded persisted store: {len(PERSISTED_STORE.get('samples', {}))} samples")
+        # Avoid noisy repeated INFO logs during startup; use DEBUG for routine loads
+        logger.debug(f"Loaded persisted store: {len(PERSISTED_STORE.get('samples', {}))} samples")
         
         # Load progress back into LESSONS
         progress_data = PERSISTED_STORE.get("progress", {})
@@ -253,7 +254,11 @@ def rescan_samples():
             "new_vocabs_added": len(new_vocabs),
             "new_vocabs": new_vocabs,
         }
-        logger.info(f"Rescan completed: {len(new_samples)} new samples, {len(new_vocabs)} new vocabs")
+        # Only log at INFO when there are new items; otherwise use DEBUG to reduce noise
+        if len(new_samples) or len(new_vocabs):
+            logger.info(f"Rescan completed: {len(new_samples)} new samples, {len(new_vocabs)} new vocabs")
+        else:
+            logger.debug(f"Rescan completed: {len(new_samples)} new samples, {len(new_vocabs)} new vocabs")
         return report
     except Exception as e:
         logger.error(f"Rescan failed: {e}")
