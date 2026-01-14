@@ -7,7 +7,7 @@ import json
 import time
 from typing import Optional, Dict, Any
 from pathlib import Path
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -149,6 +149,12 @@ def index():
     return FileResponse(str(index_path), media_type="text/html")
 
 
+@app.head("/")
+def head_root():
+    """Respond to HEAD on root for health probes."""
+    return Response(status_code=200)
+
+
 @app.get("/health")
 def health_check():
     return {
@@ -156,6 +162,12 @@ def health_check():
         "samples_count": len(helpers.PERSISTED_STORE.get("samples", {})),
         "lessons_count": len(helpers.LESSONS)
     }
+
+
+@app.head("/health")
+def head_health():
+    """HEAD health check endpoint to satisfy probes."""
+    return Response(status_code=200)
 
 
 @app.get("/ping")

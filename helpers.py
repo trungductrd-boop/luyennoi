@@ -145,22 +145,33 @@ def save_persisted_store():
         # Ensure destination dir exists
         os.makedirs(os.path.dirname(VOCAB_STORE_FILE) or ".", exist_ok=True)
         # If portalocker available, acquire exclusive lock while writing
+        # Write atomically to avoid watchers seeing partial files and to reduce reload triggers.
+        tmp_path = VOCAB_STORE_FILE + ".tmp"
+        # Ensure destination dir exists
+        os.makedirs(os.path.dirname(VOCAB_STORE_FILE) or ".", exist_ok=True)
         if portalocker:
             # ensure lock file exists
             open(LOCK_PATH, "a").close()
             with open(LOCK_PATH, "r+") as lockf:
                 portalocker.lock(lockf, portalocker.LockFlags.EXCLUSIVE)
                 try:
-                    with open(VOCAB_STORE_FILE, "w", encoding="utf-8") as f:
+                    with open(tmp_path, "w", encoding="utf-8") as f:
                         json.dump(PERSISTED_STORE, f, ensure_ascii=False, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    # atomic replace
+                    os.replace(tmp_path, VOCAB_STORE_FILE)
                 finally:
                     try:
                         portalocker.unlock(lockf)
                     except Exception:
                         pass
         else:
-            with open(VOCAB_STORE_FILE, "w", encoding="utf-8") as f:
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(PERSISTED_STORE, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, VOCAB_STORE_FILE)
         logger.info("Persisted store saved successfully (path=%s)", VOCAB_STORE_FILE)
     except Exception as e:
         logger.error(f"Error saving store: {e}")
