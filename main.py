@@ -104,11 +104,11 @@ async def startup_event():
             pass
         try:
             with open(leader_lock_path, "r+") as lf:
-                portalocker.lock(lf, portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING)
+                # Try to become leader, but DO NOT perform write operations during startup.
+                # Writing at startup can cause file churn and restart loops when using file watchers.
                 try:
-                    helpers.logger.info("Acquired leader lock; performing startup rescan/save (pid=%d)", os.getpid())
-                    startup_report = helpers.rescan_samples()
-                    helpers.logger.info(f"Startup rescan report: {startup_report}")
+                    portalocker.lock(lf, portalocker.LockFlags.EXCLUSIVE | portalocker.LockFlags.NON_BLOCKING)
+                    helpers.logger.info("Acquired leader lock; skipping rescan/save at startup to avoid writes (pid=%d)", os.getpid())
                 finally:
                     try:
                         portalocker.unlock(lf)
@@ -119,13 +119,8 @@ async def startup_event():
         except Exception as e:
             helpers.logger.warning(f"Leader lock attempt failed: {e}")
     else:
-        # portalocker not available: fallback to single-process behaviour (may duplicate work)
-        try:
-            helpers.logger.warning("portalocker not installed; performing rescan in startup (may run in multiple workers)")
-            startup_report = helpers.rescan_samples()
-            helpers.logger.info(f"Startup rescan report: {startup_report}")
-        except Exception:
-            pass
+        # portalocker not available: do NOT run rescan here to avoid duplicated writes across workers.
+        helpers.logger.warning("portalocker not installed; skipping rescan at startup to avoid writes")
     helpers.logger.info("Server started successfully")
     try:
         # Kick off background warming of sample feature cache to reduce analysis latency
