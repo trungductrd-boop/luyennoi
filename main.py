@@ -18,6 +18,7 @@ import uvicorn
 # Local imports so `uvicorn main:app` works on deploy
 import helpers
 from audio_api import router as audio_router
+from audio_api import warm_sample_cache_background
 
 # --- FastAPI app setup ---
 app = FastAPI(
@@ -87,6 +88,11 @@ async def startup_event():
     """Initialize on startup"""
     helpers.load_persisted_store()
     helpers.logger.info("Server started successfully")
+    try:
+        # Kick off background warming of sample feature cache to reduce analysis latency
+        warm_sample_cache_background()
+    except Exception:
+        pass
 
 
 @app.get("/")

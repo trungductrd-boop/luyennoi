@@ -149,6 +149,22 @@ def _get_cached_features(path: str):
 	return feats
 
 
+def _extract_features_with_timeout(path: str, timeout: int = 60):
+	"""Run helpers.extract_features in a separate process with a timeout (seconds).
+
+	Raises the underlying exception or concurrent.futures.TimeoutError on timeout.
+	"""
+	if not path:
+		raise ValueError("no path provided")
+	try:
+		with ProcessPoolExecutor(max_workers=1) as pexec:
+			fut = pexec.submit(helpers.extract_features, path)
+			return fut.result(timeout=timeout)
+	except Exception:
+		# Let caller handle/logging
+		raise
+
+
 def _warm_sample_cache_blocking(paths: list[str]):
 	"""Extract features for given paths in parallel using a process pool (blocking)."""
 	results = {}
@@ -847,8 +863,12 @@ async def api_analyze_compare(
 			return _default_compare_response(f"Reference audio file not found: {ref_filename}")
 
 		# Extract features and compare
+		# Extract features with process pool and timeout to avoid blocking
+		# api_analyze_compare does not accept a user-provided `timeout` field;
+		# use a conservative default here to avoid NameError.
 		try:
-			user_features = helpers.extract_features(user_wav_path)
+			timeout_sec = 60
+			user_features = _extract_features_with_timeout(user_wav_path, timeout=max(5, int(timeout_sec)))
 		except Exception as e:
 			helpers.logger.error(f"Feature extraction failed: {e}")
 			try:
@@ -859,7 +879,7 @@ async def api_analyze_compare(
 			return _default_compare_response("Feature extraction failed")
 
 		try:
-			ref_features = helpers.extract_features(ref_path)
+			ref_features = _extract_features_with_timeout(ref_path, timeout=max(5, int(timeout_sec)))
 		except Exception as e:
 			helpers.logger.error(f"Feature extraction (ref) failed: {e}")
 			try:
@@ -1010,8 +1030,8 @@ async def api_analyze(
 				return _default_compare_response(f"Reference audio file not found: {ref_filename}")
 
 			try:
-				user_features = helpers.extract_features(user_wav_path)
-				ref_features = helpers.extract_features(ref_path)
+				user_features = _extract_features_with_timeout(user_wav_path, timeout=max(5, int(timeout)))
+				ref_features = _extract_features_with_timeout(ref_path, timeout=max(5, int(timeout)))
 			except Exception as e:
 				helpers.logger.error(f"Feature extraction failed: {e}")
 				return _default_compare_response("Feature extraction failed")
@@ -1054,8 +1074,9 @@ async def api_analyze(
 			}
 
 		# Otherwise, auto-detect best matching sample across all samples
+		# Extract user features via process pool to use multiple cores and avoid blocking
 		try:
-			user_features = helpers.extract_features(user_wav_path)
+			user_features = _extract_features_with_timeout(user_wav_path, timeout=60)
 		except Exception as e:
 			helpers.logger.error(f"Feature extraction failed: {e}")
 			return _default_auto_response("Feature extraction failed")
@@ -1070,14 +1091,46 @@ async def api_analyze(
 				pass
 			raise HTTPException(status_code=404, detail="No reference samples found. Please upload sample audios first.")
 
-		# Build candidate list then compare in parallel to reduce latency
+		# If a specific vocab_id or word was provided, restrict candidates to matching samples only
 		candidates = []
-		for s_id, meta in samples_meta.items():
-			ref_filename = meta.get("filename")
-			ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
-			if not os.path.exists(ref_path):
-				continue
-			candidates.append((s_id, meta, ref_path))
+		if vocab_id or (word and str(word).strip()):
+			q = (word or vocab_id).strip().lower()
+			for s_id, meta in samples_meta.items():
+				ref_filename = meta.get("filename")
+				if not ref_filename:
+					continue
+				ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
+				if not os.path.exists(ref_path):
+					continue
+				# try to resolve vocab info for this sample and match by word or vocab_id
+				try:
+					vinfo = _get_vocab_info(s_id, meta) or {}
+				except Exception:
+					vinfo = {}
+				vword = (vinfo.get("word") or "").strip().lower()
+				if vocab_id and meta.get("vocab_id") == vocab_id:
+					candidates.append((s_id, meta, ref_path))
+				elif q and vword and q == vword:
+					candidates.append((s_id, meta, ref_path))
+				elif q and vword and q in vword:
+					# allow substring match (e.g., user sends 'xin chao' and stored word is 'Xin chào')
+					candidates.append((s_id, meta, ref_path))
+			# if none found for the requested word/vocab, return informative error
+			if not candidates:
+				try:
+					if created_tmp and user_wav_path and os.path.exists(user_wav_path):
+						os.remove(user_wav_path)
+				except Exception:
+					pass
+				raise HTTPException(status_code=404, detail=f"No reference samples found for word/vocab '{q}'")
+		else:
+			# Build candidate list then compare in parallel to reduce latency
+			for s_id, meta in samples_meta.items():
+				ref_filename = meta.get("filename")
+				ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
+				if not os.path.exists(ref_path):
+					continue
+				candidates.append((s_id, meta, ref_path))
 
 		matches = []
 		if candidates:
@@ -1345,8 +1398,8 @@ def _handle_vocab_mode(user_wav_path: str, vocab_id: Optional[str], word: Option
 		if ref_path:
 			try:
 				helpers.logger.info(f"_handle_vocab_mode: attempting feature-compare against {ref_path}")
-				user_feats = helpers.extract_features(user_wav_path)
-				ref_feats = _get_cached_features(ref_path) or helpers.extract_features(ref_path)
+				user_feats = _extract_features_with_timeout(user_wav_path, timeout=max(5, int(timeout)))
+				ref_feats = _get_cached_features(ref_path) or _extract_features_with_timeout(ref_path, timeout=max(5, int(timeout)))
 				mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_feats, ref_feats)
 				# normalize to 0..1
 				mfcc_score = max(0.0, min(1.0, 1.0 - (mfcc_dist / 100.0)))
@@ -1458,7 +1511,7 @@ async def api_analyze_auto(
 					return _default_auto_response("Audio conversion failed")
 
 		try:
-			user_features = helpers.extract_features(user_wav_path)
+			user_features = _extract_features_with_timeout(user_wav_path, timeout=60)
 		except Exception as e:
 			helpers.logger.error(f"Feature extraction failed: {e}")
 			return _default_auto_response("Feature extraction failed")
@@ -1621,7 +1674,7 @@ async def api_analyze_vocab(
 
 		# Extract user features
 		try:
-			user_features = helpers.extract_features(user_wav_path)
+			user_features = _extract_features_with_timeout(user_wav_path, timeout=60)
 		except Exception as e:
 			helpers.logger.error(f"Feature extraction failed: {e}")
 			try:
