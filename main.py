@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
+import gc
 try:
     import portalocker
 except Exception:
@@ -122,11 +123,9 @@ async def startup_event():
         # portalocker not available: do NOT run rescan here to avoid duplicated writes across workers.
         helpers.logger.warning("portalocker not installed; skipping rescan at startup to avoid writes")
     helpers.logger.info("Server started successfully")
-    try:
-        # Kick off background warming of sample feature cache to reduce analysis latency
-        warm_sample_cache_background()
-    except Exception:
-        pass
+    # NOTE: Do NOT warm the entire sample cache at startup. Warming all samples
+    # can consume large amounts of RAM and cause issues on constrained hosts
+    # (Render free). Warm cache on-demand (via admin endpoint or after rescan).
 
 
 @app.get("/")
@@ -328,7 +327,15 @@ async def api_compare(user: UploadFile = File(...), sample: Optional[UploadFile]
                 os.remove(sample_path)
         except Exception:
             pass
-
+    # Free large objects and suggest GC to release memory promptly on constrained hosts
+    try:
+        del f1, f2
+    except Exception:
+        pass
+    try:
+        gc.collect()
+    except Exception:
+        pass
     return {
         "mfcc_distance": mfcc_dist,
         "pitch_diff": pitch_diff,

@@ -225,7 +225,8 @@ def extract_features(path: str):
             warnings.simplefilter("ignore")
             y, sr = librosa.load(path, sr=16000)
         
-        mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13), axis=1)
+        # Use fewer MFCCs to reduce memory usage on constrained hosts
+        mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=10), axis=1)
         
         # More robust pitch extraction
         pitch, magnitude = librosa.piptrack(y=y, sr=sr)
