@@ -16,6 +16,15 @@ try:
 except Exception:
     portalocker = None
 
+# Try to import optional audio_features helper module (may not exist in minimal installs)
+try:
+    from . import audio_features
+except Exception:
+    try:
+        import audio_features
+    except Exception:
+        audio_features = None
+
 # --- Configuration ---
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
 SAMPLES_DIR = "data/samples"
@@ -223,12 +232,31 @@ def extract_features(path: str):
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            y, sr = librosa.load(path, sr=16000)
+            # AudioFeatures will handle MFCC extraction (with deltas)
+            # We still load audio below for pitch/tempo, but delegate MFCC to audio_features
+            pass
         
-        # Use fewer MFCCs to reduce memory usage on constrained hosts
-        mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=10), axis=1)
+        # Use audio_features helper to compute mean MFCC + deltas as 1D vector when available
+        if audio_features is not None:
+            try:
+                mfcc_arr = audio_features.extract_mfcc_mean(path, n_mfcc=13, sr=16000, include_deltas=True)
+                mfcc = mfcc_arr
+            except Exception:
+                mfcc = None
+        else:
+            mfcc = None
+
+        if mfcc is None:
+            # fallback to older method if audio_features missing or fails
+            y, sr = librosa.load(path, sr=16000)
+            mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=10), axis=1)
         
         # More robust pitch extraction
+        # ensure we have audio loaded for pitch/tempo; load if not already
+        try:
+            y
+        except NameError:
+            y, sr = librosa.load(path, sr=16000)
         pitch, magnitude = librosa.piptrack(y=y, sr=sr)
         pitch_values = pitch[magnitude > np.median(magnitude)]
         positive_pitch = pitch_values[pitch_values > 0]
@@ -240,9 +268,13 @@ def extract_features(path: str):
             tempo = float(tempo)
         except Exception:
             tempo = 120.0  # Default BPM if extraction fails
-        
         logger.info(f"Extracted features from {path}")
-        return {"mfcc": mfcc.tolist(), "pitch": pitch_mean, "tempo": tempo}
+        # Ensure mfcc is serializable list
+        if isinstance(mfcc, np.ndarray):
+            mfcc_list = mfcc.tolist()
+        else:
+            mfcc_list = list(mfcc)
+        return {"mfcc": mfcc_list, "pitch": pitch_mean, "tempo": tempo}
     except Exception as e:
         logger.error(f"Feature extraction failed for {path}: {e}")
         raise

@@ -4,6 +4,7 @@ import socket
 import subprocess
 import uuid
 import json
+import base64
 import time
 from typing import Optional, Dict, Any
 from pathlib import Path
@@ -254,12 +255,268 @@ async def api_compare(user: UploadFile = File(...), sample: Optional[UploadFile]
                 pass
             raise HTTPException(status_code=404, detail=f"Sample file missing on server: {fn}")
     else:
+        # No sample provided: attempt to find best matching sample from persisted store
+        try:
+            # Convert user file to standard WAV for feature extraction
+            user_conv = user_temp_path + ".conv.wav"
+            try:
+                helpers.convert_to_wav16_mono(user_temp_path, user_conv)
+            except Exception:
+                try:
+                    os.remove(user_temp_path)
+                except Exception:
+                    pass
+                raise HTTPException(status_code=500, detail="Error converting user audio for auto-match")
+
+            try:
+                f2 = helpers.extract_features(user_conv)
+            except Exception:
+                for p in (user_temp_path, user_conv):
+                    try:
+                        if os.path.exists(p):
+                            os.remove(p)
+                    except Exception:
+                        pass
+                raise HTTPException(status_code=400, detail="Failed to analyze user audio for auto-match")
+
+            helpers.load_persisted_store()
+            samples_meta = helpers.PERSISTED_STORE.get("samples", {})
+            # If the uploaded user filename matches a sample id or filename, use that sample directly
+            user_base = os.path.splitext(user_name)[0]
+            direct_sid = None
+            # check if filename (without ext) is a sample id
+            if user_base in samples_meta:
+                direct_sid = user_base
+            else:
+                # check for exact filename match
+                for sid, meta in samples_meta.items():
+                    if meta.get("filename") == user_name or meta.get("filename") == os.path.basename(user_name):
+                        direct_sid = sid
+                        break
+
+            if direct_sid:
+                sample_meta = samples_meta.get(direct_sid)
+                fn = sample_meta.get("filename") if sample_meta else None
+                sample_path = os.path.join(helpers.SAMPLES_DIR, fn) if fn else None
+                if not sample_path or not os.path.exists(sample_path):
+                    raise HTTPException(status_code=404, detail=f"Matched sample file missing on server: {fn}")
+                # use this sample and compare
+                f1 = helpers.extract_features(sample_path)
+                mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(f1, f2)
+
+                if mfcc_dist < 40:
+                    feedback = "Rất giống! Bạn phát âm tốt."
+                elif mfcc_dist < 80:
+                    feedback = "Khá giống, cần điều chỉnh một chút."
+                else:
+                    feedback = "Cần luyện thêm — âm khác nhiều so với mẫu."
+                if pitch_diff > 30:
+                    feedback += "\nCao độ khác nhiều, hãy nói cao/trầm hơn."
+                if tempo_diff > 20:
+                    feedback += "\nTốc độ nói khác, thử chậm hoặc nhanh hơn chút."
+
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
+
+                return {
+                    "matched_sample_id": direct_sid,
+                    "matched_filename": os.path.basename(sample_path) if sample_path else None,
+                    "mfcc_distance": mfcc_dist,
+                    "pitch_diff": pitch_diff,
+                    "tempo_diff": tempo_diff,
+                    "feedback": feedback,
+                    "features_sample": f1,
+                    "features_user": f2,
+                }
+            best_id = None
+            best_path = None
+            best_dist = None
+            best_features = None
+            # Iterate samples and find minimal MFCC distance (may be slow for many files)
+            for sid, meta in samples_meta.items():
+                fn = meta.get("filename")
+                if not fn:
+                    continue
+                sp = os.path.join(helpers.SAMPLES_DIR, fn)
+                if not os.path.exists(sp):
+                    continue
+                try:
+                    sf = helpers.extract_features(sp)
+                except Exception:
+                    continue
+                mfcc_dist, _, _ = helpers.compare_features_dicts(sf, f2)
+                if best_dist is None or mfcc_dist < best_dist:
+                    best_dist = mfcc_dist
+                    best_id = sid
+                    best_path = sp
+                    best_features = sf
+
+            # cleanup user temp files (we will not keep user_conv)
+            for p in (user_temp_path, user_conv):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+
+            if not best_id:
+                raise HTTPException(status_code=404, detail="No matching sample found on server")
+
+            # Compare with best matched sample only
+            f1 = best_features
+            mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(f1, f2)
+
+            if mfcc_dist < 40:
+                feedback = "Rất giống! Bạn phát âm tốt."
+            elif mfcc_dist < 80:
+                feedback = "Khá giống, cần điều chỉnh một chút."
+            else:
+                feedback = "Cần luyện thêm — âm khác nhiều so với mẫu."
+            if pitch_diff > 30:
+                feedback += "\nCao độ khác nhiều, hãy nói cao/trầm hơn."
+            if tempo_diff > 20:
+                feedback += "\nTốc độ nói khác, thử chậm hoặc nhanh hơn chút."
+
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
+            return {
+                "matched_sample_id": best_id,
+                "matched_filename": os.path.basename(best_path) if best_path else None,
+                "mfcc_distance": mfcc_dist,
+                "pitch_diff": pitch_diff,
+                "tempo_diff": tempo_diff,
+                "feedback": feedback,
+                "features_sample": f1,
+                "features_user": f2,
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            try:
+                os.remove(user_temp_path)
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"Auto-match error: {e}")
+
+    # delegate conversion, feature extraction, comparison, cleanup to helper
+    return _compare_audio_paths(sample_path, user_temp_path, sample_uploaded_temp)
+
+
+class CompareJSON(BaseModel):
+    user_b64: str
+    sample_b64: Optional[str] = None
+    sample_id: Optional[str] = None
+    user_filename: Optional[str] = None
+    sample_filename: Optional[str] = None
+
+
+@app.post("/compare_json", summary="Compare using JSON with base64 audio (user required)")
+async def api_compare_json(payload: CompareJSON):
+    # decode user audio
+    try:
+        user_bytes = base64.b64decode(payload.user_b64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 in user_b64")
+    if len(user_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Empty user audio")
+    if len(user_bytes) > helpers.MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="User file too large")
+
+    user_name = safe_filename(payload.user_filename or "user.wav")
+    user_ext = os.path.splitext(user_name)[1] or ".wav"
+    user_temp_path = os.path.join(helpers.USERS_DIR, f"u_{uuid.uuid4().hex}{user_ext}")
+    with open(user_temp_path, "wb") as f:
+        f.write(user_bytes)
+
+    sample_path = None
+    sample_uploaded_temp = False
+    if payload.sample_b64:
+        try:
+            sample_bytes = base64.b64decode(payload.sample_b64)
+        except Exception:
+            try:
+                os.remove(user_temp_path)
+            except Exception:
+                pass
+            raise HTTPException(status_code=400, detail="Invalid base64 in sample_b64")
+        if len(sample_bytes) > helpers.MAX_UPLOAD_BYTES:
+            try:
+                os.remove(user_temp_path)
+            except Exception:
+                pass
+            raise HTTPException(status_code=413, detail="Sample file too large")
+        sample_name = safe_filename(payload.sample_filename or "sample.wav")
+        sample_ext = os.path.splitext(sample_name)[1] or ".wav"
+        sample_temp_path = os.path.join(helpers.SAMPLES_DIR, f"s_{uuid.uuid4().hex}{sample_ext}")
+        with open(sample_temp_path, "wb") as f:
+            f.write(sample_bytes)
+        sample_path = sample_temp_path
+        sample_uploaded_temp = True
+    elif payload.sample_id:
+        helpers.load_persisted_store()
+        sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(payload.sample_id)
+        if not sample_meta:
+            try:
+                os.remove(user_temp_path)
+            except Exception:
+                pass
+            raise HTTPException(status_code=404, detail="sample_id not found")
+        fn = sample_meta.get("filename")
+        if not fn:
+            try:
+                os.remove(user_temp_path)
+            except Exception:
+                pass
+            raise HTTPException(status_code=404, detail="No audio file available for this sample_id")
+        sample_path = os.path.join(helpers.SAMPLES_DIR, fn)
+        if not os.path.exists(sample_path):
+            try:
+                os.remove(user_temp_path)
+            except Exception:
+                pass
+            raise HTTPException(status_code=404, detail=f"Sample file missing on server: {fn}")
+    else:
+        # attempt to detect sample_id from provided user_filename
+        helpers.load_persisted_store()
+        samples_meta = helpers.PERSISTED_STORE.get("samples", {})
+        user_name_safe = safe_filename(payload.user_filename or "")
+        user_base = os.path.splitext(user_name_safe)[0]
+        direct_sid = None
+        if user_base in samples_meta:
+            direct_sid = user_base
+        else:
+            for sid, meta in samples_meta.items():
+                if meta.get("filename") == user_name_safe or meta.get("filename") == os.path.basename(user_name_safe):
+                    direct_sid = sid
+                    break
+        if direct_sid:
+            sample_meta = samples_meta.get(direct_sid)
+            fn = sample_meta.get("filename") if sample_meta else None
+            sample_path = os.path.join(helpers.SAMPLES_DIR, fn) if fn else None
+            if not sample_path or not os.path.exists(sample_path):
+                try:
+                    os.remove(user_temp_path)
+                except Exception:
+                    pass
+                raise HTTPException(status_code=404, detail=f"Matched sample file missing on server: {fn}")
+            # delegate to compare helper
+            return _compare_audio_paths(sample_path, user_temp_path, False)
         try:
             os.remove(user_temp_path)
         except Exception:
             pass
-        raise HTTPException(status_code=400, detail="Either sample file or sample_id must be provided")
+        raise HTTPException(status_code=400, detail="Either sample_b64, sample_id, or user_filename matching a sample must be provided")
 
+    return _compare_audio_paths(sample_path, user_temp_path, sample_uploaded_temp)
+
+
+def _compare_audio_paths(sample_path: str, user_temp_path: str, sample_uploaded_temp: bool = False) -> Dict[str, Any]:
+    """Convert files, extract features, compare and cleanup. Returns response dict."""
     sample_conv = sample_path + ".conv.wav"
     user_conv = user_temp_path + ".conv.wav"
     try:
@@ -301,6 +558,7 @@ async def api_compare(user: UploadFile = File(...), sample: Optional[UploadFile]
             except Exception:
                 pass
         raise HTTPException(status_code=400, detail="Failed to analyze audio. Ensure files are valid speech recordings.")
+
     mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(f1, f2)
 
     if mfcc_dist < 40:
@@ -327,7 +585,10 @@ async def api_compare(user: UploadFile = File(...), sample: Optional[UploadFile]
                 os.remove(sample_path)
         except Exception:
             pass
-    # Free large objects and suggest GC to release memory promptly on constrained hosts
+
+    # keep copies of extracted features for the response, then release originals
+    features_sample = f1
+    features_user = f2
     try:
         del f1, f2
     except Exception:
@@ -336,13 +597,14 @@ async def api_compare(user: UploadFile = File(...), sample: Optional[UploadFile]
         gc.collect()
     except Exception:
         pass
+
     return {
         "mfcc_distance": mfcc_dist,
         "pitch_diff": pitch_diff,
         "tempo_diff": tempo_diff,
         "feedback": feedback,
-        "features_sample": f1,
-        "features_user": f2,
+        "features_sample": features_sample,
+        "features_user": features_user,
     }
 
 
