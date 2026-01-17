@@ -201,14 +201,19 @@ def api_compare_features(sample: dict, user: dict):
 
 
 @app.post("/compare", summary="Compare user audio with sample (upload sample file or provide sample_id)")
-async def api_compare(user: UploadFile = File(...), sample: Optional[UploadFile] = File(None), sample_id: Optional[str] = Form(None)):
-    user_bytes = await user.read()
+async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[UploadFile] = File(None), sample: Optional[UploadFile] = File(None), sample_id: Optional[str] = Form(None)):
+    # Accept upload under either `user` or `file` field (client may send `file`)
+    upload = user or file
+    if not upload:
+        raise HTTPException(status_code=400, detail="No user file provided")
+
+    user_bytes = await upload.read()
     if len(user_bytes) == 0:
         raise HTTPException(status_code=400, detail="Empty user file")
     if len(user_bytes) > helpers.MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="User file too large")
 
-    user_name = safe_filename(user.filename)
+    user_name = safe_filename(upload.filename)
     user_ext = os.path.splitext(user_name)[1] or ".wav"
     user_temp_path = os.path.join(helpers.USERS_DIR, f"u_{uuid.uuid4().hex}{user_ext}")
     with open(user_temp_path, "wb") as f:
