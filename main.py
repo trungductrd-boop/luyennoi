@@ -204,7 +204,7 @@ def api_compare_features(sample: dict, user: dict):
 
 
 @app.post("/compare", summary="Compare user audio with sample (upload sample file or provide sample_id)")
-async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[UploadFile] = File(None), sample: Optional[UploadFile] = File(None), sample_id: Optional[str] = Form(None)):
+async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[UploadFile] = File(None), sample: Optional[UploadFile] = File(None), sample_id: Optional[str] = Form(None), background_tasks: BackgroundTasks = None):
     # Accept upload under either `user` or `file` field (client may send `file`)
     upload = user or file
     if not upload:
@@ -262,177 +262,28 @@ async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[Up
             except Exception:
                 pass
             raise HTTPException(status_code=404, detail=f"Sample file missing on server: {fn}")
-    else:
-        # No sample provided: attempt to find best matching sample from persisted store
-        try:
-            # Convert user file to standard WAV for feature extraction
-            user_conv = user_temp_path + ".conv.wav"
-            try:
-                helpers.convert_to_wav16_mono(user_temp_path, user_conv)
-            except Exception:
-                try:
-                    os.remove(user_temp_path)
-                except Exception:
-                    pass
-                raise HTTPException(status_code=500, detail="Error converting user audio for auto-match")
+    # Create job and offload heavy work to background task
+    job_id = uuid.uuid4().hex
+    jobs_dir = os.path.join(helpers.TMP_DIR, "jobs")
+    try:
+        os.makedirs(jobs_dir, exist_ok=True)
+    except Exception:
+        pass
 
-            # Use audio_api optimized extraction (process pool) so we don't block event loop
-            try:
-                f2 = _extract_features_with_timeout(user_conv, timeout=30)
-            except Exception:
-                for p in (user_temp_path, user_conv):
-                    try:
-                        if os.path.exists(p):
-                            os.remove(p)
-                    except Exception:
-                        pass
-                raise HTTPException(status_code=400, detail="Failed to analyze user audio for auto-match")
+    job_file = os.path.join(jobs_dir, f"{job_id}.json")
+    # Seed job file
+    try:
+        with open(job_file, "w", encoding="utf-8") as jf:
+            json.dump({"status": "processing", "created": time.time()}, jf)
+    except Exception:
+        pass
 
-            helpers.load_persisted_store()
-            samples_meta = helpers.PERSISTED_STORE.get("samples", {})
-            # If the uploaded user filename matches a sample id or filename, use that sample directly
-            user_base = os.path.splitext(user_name)[0]
-            direct_sid = None
-            # check if filename (without ext) is a sample id
-            if user_base in samples_meta:
-                direct_sid = user_base
-            else:
-                # check for exact filename match
-                for sid, meta in samples_meta.items():
-                    if meta.get("filename") == user_name or meta.get("filename") == os.path.basename(user_name):
-                        direct_sid = sid
-                        break
+    # schedule background processing
+    if background_tasks is None:
+        raise HTTPException(status_code=500, detail="Server misconfiguration: BackgroundTasks unavailable")
+    background_tasks.add_task(process_compare_job, sample_path, user_temp_path, sample_uploaded_temp, sample_id, job_id)
 
-            if direct_sid:
-                sample_meta = samples_meta.get(direct_sid)
-                fn = sample_meta.get("filename") if sample_meta else None
-                sample_path = os.path.join(helpers.SAMPLES_DIR, fn) if fn else None
-                if not sample_path or not os.path.exists(sample_path):
-                    raise HTTPException(status_code=404, detail=f"Matched sample file missing on server: {fn}")
-                # use cached features when available
-                f1 = _get_cached_features(sample_path) or _extract_features_with_timeout(sample_path, timeout=30)
-                mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(f1, f2)
-
-                if mfcc_dist < 40:
-                    feedback = "Rất giống! Bạn phát âm tốt."
-                elif mfcc_dist < 80:
-                    feedback = "Khá giống, cần điều chỉnh một chút."
-                else:
-                    feedback = "Cần luyện thêm — âm khác nhiều so với mẫu."
-                if pitch_diff > 30:
-                    feedback += "\nCao độ khác nhiều, hãy nói cao/trầm hơn."
-                if tempo_diff > 20:
-                    feedback += "\nTốc độ nói khác, thử chậm hoặc nhanh hơn chút."
-
-                try:
-                    gc.collect()
-                except Exception:
-                    pass
-
-                return {
-                    "matched_sample_id": direct_sid,
-                    "matched_filename": os.path.basename(sample_path) if sample_path else None,
-                    "mfcc_distance": mfcc_dist,
-                    "pitch_diff": pitch_diff,
-                    "tempo_diff": tempo_diff,
-                    "feedback": feedback,
-                    "features_sample": f1,
-                    "features_user": f2,
-                }
-
-            # Build candidate list
-            candidates = []
-            for sid, meta in samples_meta.items():
-                fn = meta.get("filename")
-                if not fn:
-                    continue
-                sp = os.path.join(helpers.SAMPLES_DIR, fn)
-                if not os.path.exists(sp):
-                    continue
-                candidates.append((sid, meta, sp))
-
-            # Compare in parallel using audio_api._build_match_entry which uses cached features
-            matches = []
-            if candidates:
-                max_workers = min(8, len(candidates))
-                with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
-                    futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, f2) for (s_id, meta, ref_path) in candidates]
-                    for fut in as_completed(futures):
-                        try:
-                            res = fut.result()
-                            if res:
-                                matches.append(res)
-                        except Exception:
-                            continue
-
-            # cleanup user temp files (we will not keep user_conv)
-            for p in (user_temp_path, user_conv):
-                try:
-                    if os.path.exists(p):
-                        os.remove(p)
-                except Exception:
-                    pass
-
-            if not matches:
-                raise HTTPException(status_code=404, detail="No matching sample found on server")
-
-            matches.sort(key=lambda x: x["overall_score"], reverse=True)
-            best = matches[0]
-            best_id = best.get("sample_id")
-            best_path = os.path.join(helpers.SAMPLES_DIR, best.get("filename")) if best.get("filename") else None
-            # fetch cached features for response
-            best_features = _get_cached_features(best_path) if best_path else None
-
-            mfcc_dist = best.get("details", {}).get("mfcc_distance")
-            pitch_diff = best.get("details", {}).get("pitch_difference_hz")
-            tempo_diff = best.get("details", {}).get("tempo_difference_bpm")
-
-            if mfcc_dist is None and best_features and f2:
-                try:
-                    mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(best_features, f2)
-                except Exception:
-                    mfcc_dist, pitch_diff, tempo_diff = None, None, None
-
-            if mfcc_dist is not None:
-                if mfcc_dist < 40:
-                    feedback = "Rất giống! Bạn phát âm tốt."
-                elif mfcc_dist < 80:
-                    feedback = "Khá giống, cần điều chỉnh một chút."
-                else:
-                    feedback = "Cần luyện thêm — âm khác nhiều so với mẫu."
-                if pitch_diff and pitch_diff > 30:
-                    feedback += "\nCao độ khác nhiều, hãy nói cao/trầm hơn."
-                if tempo_diff and tempo_diff > 20:
-                    feedback += "\nTốc độ nói khác, thử chậm hoặc nhanh hơn chút."
-            else:
-                feedback = best.get("comment") or ""
-
-            try:
-                gc.collect()
-            except Exception:
-                pass
-
-            return {
-                "matched_sample_id": best_id,
-                "matched_filename": os.path.basename(best_path) if best_path else None,
-                "mfcc_distance": mfcc_dist,
-                "pitch_diff": pitch_diff,
-                "tempo_diff": tempo_diff,
-                "feedback": feedback,
-                "features_sample": best_features,
-                "features_user": f2,
-            }
-        except HTTPException:
-            raise
-        except Exception as e:
-            try:
-                os.remove(user_temp_path)
-            except Exception:
-                pass
-            raise HTTPException(status_code=500, detail=f"Auto-match error: {e}")
-
-    # delegate conversion, feature extraction, comparison, cleanup to helper
-    return _compare_audio_paths(sample_path, user_temp_path, sample_uploaded_temp)
+    return {"status": "processing", "job_id": job_id}
 
 
 class CompareJSON(BaseModel):
@@ -634,6 +485,272 @@ def _compare_audio_paths(sample_path: str, user_temp_path: str, sample_uploaded_
         "features_sample": features_sample,
         "features_user": features_user,
     }
+
+
+# -------------------------
+# Background job helpers
+# -------------------------
+def _job_file_path(job_id: str) -> str:
+    jobs_dir = os.path.join(helpers.TMP_DIR, "jobs")
+    os.makedirs(jobs_dir, exist_ok=True)
+    return os.path.join(jobs_dir, f"{job_id}.json")
+
+
+def _save_job_result(job_id: str, payload: dict):
+    try:
+        jf = _job_file_path(job_id)
+        with open(jf, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+    except Exception:
+        try:
+            # best-effort logging
+            helpers.logger.exception("Failed to save job result: %s", job_id)
+        except Exception:
+            pass
+
+
+def _load_job_result(job_id: str) -> Optional[dict]:
+    try:
+        jf = _job_file_path(job_id)
+        if not os.path.exists(jf):
+            return None
+        with open(jf, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_uploaded_temp: bool, sample_id: Optional[str], job_id: str):
+    """Background worker that performs the heavy compare work and writes job result file."""
+    try:
+        # If a sample_path or sample_id was provided, prefer direct compare via helper
+        if sample_path or sample_id:
+            # If sample_id provided but not sample_path, resolve it
+            if not sample_path and sample_id:
+                try:
+                    helpers.load_persisted_store()
+                    sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
+                    if not sample_meta:
+                        _save_job_result(job_id, {"status": "error", "error": "sample_id not found"})
+                        try:
+                            os.remove(user_temp_path)
+                        except Exception:
+                            pass
+                        return
+                    fn = sample_meta.get("filename")
+                    if not fn:
+                        _save_job_result(job_id, {"status": "error", "error": "sample file missing for sample_id"})
+                        try:
+                            os.remove(user_temp_path)
+                        except Exception:
+                            pass
+                        return
+                    sample_path = os.path.join(helpers.SAMPLES_DIR, fn)
+                except Exception as e:
+                    _save_job_result(job_id, {"status": "error", "error": str(e)})
+                    try:
+                        os.remove(user_temp_path)
+                    except Exception:
+                        pass
+                    return
+
+            # Perform compare using existing helper (handles conversion & cleanup)
+            try:
+                result = _compare_audio_paths(sample_path, user_temp_path, sample_uploaded_temp)
+                _save_job_result(job_id, {"status": "done", "result": result})
+                return
+            except HTTPException as he:
+                _save_job_result(job_id, {"status": "error", "error": he.detail, "code": he.status_code})
+                return
+
+        # Otherwise, perform auto-match flow (no sample provided)
+        user_conv = user_temp_path + ".conv.wav"
+        try:
+            helpers.convert_to_wav16_mono(user_temp_path, user_conv)
+        except Exception as e:
+            try:
+                os.remove(user_temp_path)
+            except Exception:
+                pass
+            _save_job_result(job_id, {"status": "error", "error": f"conversion_failed: {e}"})
+            return
+
+        try:
+            f2 = _extract_features_with_timeout(user_conv, timeout=30)
+        except Exception as e:
+            for p in (user_temp_path, user_conv):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+            _save_job_result(job_id, {"status": "error", "error": f"feature_extraction_failed: {e}"})
+            return
+
+        try:
+            helpers.load_persisted_store()
+            samples_meta = helpers.PERSISTED_STORE.get("samples", {})
+
+            # Attempt direct match by filename/sample id from upload name
+            user_base = os.path.splitext(os.path.basename(user_temp_path))[0]
+            direct_sid = None
+            if user_base in samples_meta:
+                direct_sid = user_base
+            else:
+                for sid, meta in samples_meta.items():
+                    if meta.get("filename") == os.path.basename(user_temp_path):
+                        direct_sid = sid
+                        break
+
+            if direct_sid:
+                sample_meta = samples_meta.get(direct_sid)
+                fn = sample_meta.get("filename") if sample_meta else None
+                sample_path = os.path.join(helpers.SAMPLES_DIR, fn) if fn else None
+                if not sample_path or not os.path.exists(sample_path):
+                    _save_job_result(job_id, {"status": "error", "error": "matched sample file missing"})
+                    try:
+                        os.remove(user_temp_path)
+                    except Exception:
+                        pass
+                    return
+
+                f1 = _get_cached_features(sample_path) or _extract_features_with_timeout(sample_path, timeout=30)
+                mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(f1, f2)
+
+                if mfcc_dist < 40:
+                    feedback = "Rất giống! Bạn phát âm tốt."
+                elif mfcc_dist < 80:
+                    feedback = "Khá giống, cần điều chỉnh một chút."
+                else:
+                    feedback = "Cần luyện thêm — âm khác nhiều so với mẫu."
+                if pitch_diff > 30:
+                    feedback += "\nCao độ khác nhiều, hãy nói cao/trầm hơn."
+                if tempo_diff > 20:
+                    feedback += "\nTốc độ nói khác, thử chậm hoặc nhanh hơn chút."
+
+                try:
+                    gc.collect()
+                except Exception:
+                    pass
+
+                resp = {
+                    "matched_sample_id": direct_sid,
+                    "matched_filename": os.path.basename(sample_path) if sample_path else None,
+                    "mfcc_distance": mfcc_dist,
+                    "pitch_diff": pitch_diff,
+                    "tempo_diff": tempo_diff,
+                    "feedback": feedback,
+                    "features_sample": f1,
+                    "features_user": f2,
+                }
+                _save_job_result(job_id, {"status": "done", "result": resp})
+                return
+
+            # Build candidates and compare in parallel
+            candidates = []
+            for sid, meta in samples_meta.items():
+                fn = meta.get("filename")
+                if not fn:
+                    continue
+                sp = os.path.join(helpers.SAMPLES_DIR, fn)
+                if not os.path.exists(sp):
+                    continue
+                candidates.append((sid, meta, sp))
+
+            matches = []
+            if candidates:
+                max_workers = min(8, len(candidates))
+                with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
+                    futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, f2) for (s_id, meta, ref_path) in candidates]
+                    for fut in as_completed(futures):
+                        try:
+                            res = fut.result()
+                            if res:
+                                matches.append(res)
+                        except Exception:
+                            continue
+
+            # cleanup user conv and temp user file
+            for p in (user_temp_path, user_conv):
+                try:
+                    if os.path.exists(p):
+                        os.remove(p)
+                except Exception:
+                    pass
+
+            if not matches:
+                _save_job_result(job_id, {"status": "error", "error": "no_matching_sample_found"})
+                return
+
+            matches.sort(key=lambda x: x.get("overall_score", 0), reverse=True)
+            best = matches[0]
+            best_id = best.get("sample_id")
+            best_path = os.path.join(helpers.SAMPLES_DIR, best.get("filename")) if best.get("filename") else None
+            best_features = _get_cached_features(best_path) if best_path else None
+
+            mfcc_dist = best.get("details", {}).get("mfcc_distance")
+            pitch_diff = best.get("details", {}).get("pitch_difference_hz")
+            tempo_diff = best.get("details", {}).get("tempo_difference_bpm")
+
+            if mfcc_dist is None and best_features and f2:
+                try:
+                    mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(best_features, f2)
+                except Exception:
+                    mfcc_dist, pitch_diff, tempo_diff = None, None, None
+
+            if mfcc_dist is not None:
+                if mfcc_dist < 40:
+                    feedback = "Rất giống! Bạn phát âm tốt."
+                elif mfcc_dist < 80:
+                    feedback = "Khá giống, cần điều chỉnh một chút."
+                else:
+                    feedback = "Cần luyện thêm — âm khác nhiều so với mẫu."
+                if pitch_diff and pitch_diff > 30:
+                    feedback += "\nCao độ khác nhiều, hãy nói cao/trầm hơn."
+                if tempo_diff and tempo_diff > 20:
+                    feedback += "\nTốc độ nói khác, thử chậm hoặc nhanh hơn chút."
+            else:
+                feedback = best.get("comment") or ""
+
+            try:
+                gc.collect()
+            except Exception:
+                pass
+
+            resp = {
+                "matched_sample_id": best_id,
+                "matched_filename": os.path.basename(best_path) if best_path else None,
+                "mfcc_distance": mfcc_dist,
+                "pitch_diff": pitch_diff,
+                "tempo_diff": tempo_diff,
+                "feedback": feedback,
+                "features_sample": best_features,
+                "features_user": f2,
+            }
+            _save_job_result(job_id, {"status": "done", "result": resp})
+            return
+
+        except Exception as e:
+            _save_job_result(job_id, {"status": "error", "error": str(e)})
+            try:
+                os.remove(user_temp_path)
+            except Exception:
+                pass
+            return
+
+    except Exception as e:
+        try:
+            _save_job_result(job_id, {"status": "error", "error": str(e)})
+        except Exception:
+            pass
+
+
+@app.get("/result/{job_id}")
+def get_result(job_id: str):
+    data = _load_job_result(job_id)
+    if data is None:
+        return {"status": "processing"}
+    return data
 
 
 # -------------------------
