@@ -37,6 +37,9 @@ TMP_DIR = "data/tmp"
 FFMPEG_BIN = "ffmpeg"
 ALLOWED_EXTS = {".wav", ".mp3", ".m4a", ".ogg"}
 
+# Fast mode: enable aggressive speedups and disable non-essential features.
+FAST_MODE = os.environ.get("FAST_MODE", "0") in ("1", "true", "True")
+
 # ensure directories exist
 os.makedirs(SAMPLES_DIR, exist_ok=True)
 os.makedirs(USERS_DIR, exist_ok=True)
@@ -96,9 +99,9 @@ PERSISTED_STORE = {"lessons": {}, "samples": {}}
 # Internal flag: track whether the persisted store has been loaded at least once
 _PERSISTED_STORE_LOADED = False
 
-# Setup logging with better format
+# Setup logging with better format. Lower verbosity in FAST_MODE to reduce overhead.
 logging.basicConfig(
-    level=logging.INFO,
+    level=(logging.WARNING if FAST_MODE else logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -232,43 +235,58 @@ def extract_features(path: str):
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            # AudioFeatures will handle MFCC extraction (with deltas)
-            # We still load audio below for pitch/tempo, but delegate MFCC to audio_features
-            pass
-        
-        # Use audio_features helper to compute mean MFCC + deltas as 1D vector when available
-        if audio_features is not None:
-            try:
-                mfcc_arr = audio_features.extract_mfcc_mean(path, n_mfcc=13, sr=16000, include_deltas=True)
-                mfcc = mfcc_arr
-            except Exception:
-                mfcc = None
-        else:
-            mfcc = None
 
-        if mfcc is None:
-            # fallback to older method if audio_features missing or fails
-            y, sr = librosa.load(path, sr=16000)
-            mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=10), axis=1)
-        
-        # More robust pitch extraction
-        # ensure we have audio loaded for pitch/tempo; load if not already
-        try:
-            y
-        except NameError:
-            y, sr = librosa.load(path, sr=16000)
-        pitch, magnitude = librosa.piptrack(y=y, sr=sr)
-        pitch_values = pitch[magnitude > np.median(magnitude)]
-        positive_pitch = pitch_values[pitch_values > 0]
-        pitch_mean = float(np.mean(positive_pitch)) if positive_pitch.size > 0 else 0.0
-        
-        # Safer tempo extraction
-        try:
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            tempo = float(tempo)
-        except Exception:
-            tempo = 120.0  # Default BPM if extraction fails
+            # Choose MFCC config depending on FAST_MODE
+            n_mfcc = 13 if not FAST_MODE else 8
+            load_kwargs = {"sr": 16000}
+            if FAST_MODE:
+                # Only load a short prefix in fast mode to reduce I/O and CPU
+                load_kwargs["duration"] = 3.0
+
+            # Load audio once
+            y, sr = librosa.load(path, **load_kwargs)
+
+            # MFCC: prefer audio_features when available and not in FAST_MODE
+            mfcc = None
+            if audio_features is not None and not FAST_MODE:
+                try:
+                    mfcc = audio_features.extract_mfcc_mean(path, n_mfcc=n_mfcc, sr=sr, include_deltas=True)
+                except Exception:
+                    mfcc = None
+
+            if mfcc is None:
+                mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc), axis=1)
+
+            # Pitch: prefer more efficient YIN estimator when available
+            pitch_mean = 0.0
+            try:
+                # librosa.yin returns f0 per frame; take median of positive finite values
+                f0 = librosa.yin(y, fmin=50, fmax=500, sr=sr)
+                f0_pos = f0[np.isfinite(f0) & (f0 > 0)]
+                if f0_pos.size > 0:
+                    pitch_mean = float(np.median(f0_pos))
+            except Exception:
+                try:
+                    # fallback to piptrack
+                    pitch, magnitude = librosa.piptrack(y=y, sr=sr)
+                    pitch_values = pitch[magnitude > np.median(magnitude)]
+                    positive_pitch = pitch_values[pitch_values > 0]
+                    pitch_mean = float(np.mean(positive_pitch)) if positive_pitch.size > 0 else 0.0
+                except Exception:
+                    pitch_mean = 0.0
+
+            # Tempo: skip costly tempo estimation in FAST_MODE
+            if FAST_MODE:
+                tempo = 120.0
+            else:
+                try:
+                    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+                    tempo = float(tempo)
+                except Exception:
+                    tempo = 120.0
+
         logger.info(f"Extracted features from {path}")
+
         # Ensure mfcc is serializable list
         if isinstance(mfcc, np.ndarray):
             mfcc_list = mfcc.tolist()

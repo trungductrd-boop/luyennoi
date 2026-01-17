@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
 import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     import portalocker
 except Exception:
@@ -25,6 +26,8 @@ except Exception:
 import helpers
 from audio_api import router as audio_router
 from audio_api import warm_sample_cache_background
+# reuse optimized helpers from audio_api for cached extraction & parallel compare
+from audio_api import _extract_features_with_timeout, _build_match_entry, _get_cached_features
 
 # --- FastAPI app setup ---
 app = FastAPI(
@@ -273,8 +276,9 @@ async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[Up
                     pass
                 raise HTTPException(status_code=500, detail="Error converting user audio for auto-match")
 
+            # Use audio_api optimized extraction (process pool) so we don't block event loop
             try:
-                f2 = helpers.extract_features(user_conv)
+                f2 = _extract_features_with_timeout(user_conv, timeout=30)
             except Exception:
                 for p in (user_temp_path, user_conv):
                     try:
@@ -305,8 +309,8 @@ async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[Up
                 sample_path = os.path.join(helpers.SAMPLES_DIR, fn) if fn else None
                 if not sample_path or not os.path.exists(sample_path):
                     raise HTTPException(status_code=404, detail=f"Matched sample file missing on server: {fn}")
-                # use this sample and compare
-                f1 = helpers.extract_features(sample_path)
+                # use cached features when available
+                f1 = _get_cached_features(sample_path) or _extract_features_with_timeout(sample_path, timeout=30)
                 mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(f1, f2)
 
                 if mfcc_dist < 40:
@@ -335,11 +339,9 @@ async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[Up
                     "features_sample": f1,
                     "features_user": f2,
                 }
-            best_id = None
-            best_path = None
-            best_dist = None
-            best_features = None
-            # Iterate samples and find minimal MFCC distance (may be slow for many files)
+
+            # Build candidate list
+            candidates = []
             for sid, meta in samples_meta.items():
                 fn = meta.get("filename")
                 if not fn:
@@ -347,16 +349,21 @@ async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[Up
                 sp = os.path.join(helpers.SAMPLES_DIR, fn)
                 if not os.path.exists(sp):
                     continue
-                try:
-                    sf = helpers.extract_features(sp)
-                except Exception:
-                    continue
-                mfcc_dist, _, _ = helpers.compare_features_dicts(sf, f2)
-                if best_dist is None or mfcc_dist < best_dist:
-                    best_dist = mfcc_dist
-                    best_id = sid
-                    best_path = sp
-                    best_features = sf
+                candidates.append((sid, meta, sp))
+
+            # Compare in parallel using audio_api._build_match_entry which uses cached features
+            matches = []
+            if candidates:
+                max_workers = min(8, len(candidates))
+                with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
+                    futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, f2) for (s_id, meta, ref_path) in candidates]
+                    for fut in as_completed(futures):
+                        try:
+                            res = fut.result()
+                            if res:
+                                matches.append(res)
+                        except Exception:
+                            continue
 
             # cleanup user temp files (we will not keep user_conv)
             for p in (user_temp_path, user_conv):
@@ -366,23 +373,39 @@ async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[Up
                 except Exception:
                     pass
 
-            if not best_id:
+            if not matches:
                 raise HTTPException(status_code=404, detail="No matching sample found on server")
 
-            # Compare with best matched sample only
-            f1 = best_features
-            mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(f1, f2)
+            matches.sort(key=lambda x: x["overall_score"], reverse=True)
+            best = matches[0]
+            best_id = best.get("sample_id")
+            best_path = os.path.join(helpers.SAMPLES_DIR, best.get("filename")) if best.get("filename") else None
+            # fetch cached features for response
+            best_features = _get_cached_features(best_path) if best_path else None
 
-            if mfcc_dist < 40:
-                feedback = "Rất giống! Bạn phát âm tốt."
-            elif mfcc_dist < 80:
-                feedback = "Khá giống, cần điều chỉnh một chút."
+            mfcc_dist = best.get("details", {}).get("mfcc_distance")
+            pitch_diff = best.get("details", {}).get("pitch_difference_hz")
+            tempo_diff = best.get("details", {}).get("tempo_difference_bpm")
+
+            if mfcc_dist is None and best_features and f2:
+                try:
+                    mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(best_features, f2)
+                except Exception:
+                    mfcc_dist, pitch_diff, tempo_diff = None, None, None
+
+            if mfcc_dist is not None:
+                if mfcc_dist < 40:
+                    feedback = "Rất giống! Bạn phát âm tốt."
+                elif mfcc_dist < 80:
+                    feedback = "Khá giống, cần điều chỉnh một chút."
+                else:
+                    feedback = "Cần luyện thêm — âm khác nhiều so với mẫu."
+                if pitch_diff and pitch_diff > 30:
+                    feedback += "\nCao độ khác nhiều, hãy nói cao/trầm hơn."
+                if tempo_diff and tempo_diff > 20:
+                    feedback += "\nTốc độ nói khác, thử chậm hoặc nhanh hơn chút."
             else:
-                feedback = "Cần luyện thêm — âm khác nhiều so với mẫu."
-            if pitch_diff > 30:
-                feedback += "\nCao độ khác nhiều, hãy nói cao/trầm hơn."
-            if tempo_diff > 20:
-                feedback += "\nTốc độ nói khác, thử chậm hoặc nhanh hơn chút."
+                feedback = best.get("comment") or ""
 
             try:
                 gc.collect()
@@ -396,7 +419,7 @@ async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[Up
                 "pitch_diff": pitch_diff,
                 "tempo_diff": tempo_diff,
                 "feedback": feedback,
-                "features_sample": f1,
+                "features_sample": best_features,
                 "features_user": f2,
             }
         except HTTPException:
@@ -645,18 +668,23 @@ def analyze_features(features: Dict[str, Any]) -> Dict[str, Any]:
         result["note"] = "Mouth small/closed."
     return result
 
-@app.post("/analyze-mouth")
-async def analyze_mouth(payload: MouthPayload, request: Request):
-    rec = {"received_at": time.time(), "payload": payload.dict(), "client": request.client.host if request.client else None}
-    fname = os.path.join(LOG_DIR, f"mouthlog_{time.strftime('%Y%m%d')}.ndjson")
-    try:
-        with open(fname, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except Exception as e:
-        print("Failed to write mouth log:", e)
-    features = payload.features or {}
-    analysis = analyze_features(features)
-    return {"ok": True, "analysis": analysis, "received_ts": payload.ts}
+if getattr(helpers, 'FAST_MODE', False):
+    @app.post("/analyze-mouth")
+    async def analyze_mouth_disabled(payload: MouthPayload, request: Request):
+        return {"ok": False, "message": "analyze-mouth disabled in FAST_MODE"}
+else:
+    @app.post("/analyze-mouth")
+    async def analyze_mouth(payload: MouthPayload, request: Request):
+        rec = {"received_at": time.time(), "payload": payload.dict(), "client": request.client.host if request.client else None}
+        fname = os.path.join(LOG_DIR, f"mouthlog_{time.strftime('%Y%m%d')}.ndjson")
+        try:
+            with open(fname, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception as e:
+            print("Failed to write mouth log:", e)
+        features = payload.features or {}
+        analysis = analyze_features(features)
+        return {"ok": True, "analysis": analysis, "received_ts": payload.ts}
 
 
 if __name__ == "__main__":

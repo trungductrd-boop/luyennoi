@@ -26,7 +26,11 @@ import threading
 
 # Background executor for light async processing
 _default_workers = max(4, (os.cpu_count() or 4))
-executor = ThreadPoolExecutor(max_workers=max(8, _default_workers))
+if getattr(helpers, 'FAST_MODE', False):
+	# In FAST_MODE keep a very small pool to reduce scheduling/overhead
+	executor = ThreadPoolExecutor(max_workers=2)
+else:
+	executor = ThreadPoolExecutor(max_workers=max(8, _default_workers))
 
 # In-memory cache for extracted sample features to avoid repeated costly extraction
 SAMPLE_FEATURES: dict = {}
@@ -374,6 +378,9 @@ async def api_upload(
 	Returns 202 with task_id for background processing.
 	"""
 	# Auth
+	if getattr(helpers, 'FAST_MODE', False):
+		raise HTTPException(status_code=503, detail="Upload endpoint disabled in FAST_MODE to prioritize low-latency analysis")
+
 	if not _require_auth(request):
 		raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -659,6 +666,8 @@ def api_samples_link(sample_id: str = Form(...), lesson_id: Optional[str] = Form
 
 @router.get("/samples/export-package", summary="Export samples + vocab_store.json as a zip for offline use")
 def api_export_package():
+	if getattr(helpers, 'FAST_MODE', False):
+		raise HTTPException(status_code=503, detail="Export disabled in FAST_MODE")
 	package_name = f"speech_package_{uuid.uuid4().hex[:8]}.zip"
 	# ensure tmp dir exists
 	os.makedirs(helpers.TMP_DIR, exist_ok=True)
@@ -691,6 +700,8 @@ def api_export_package():
 
 @router.post("/samples/import-package", summary="Import zip (samples + vocab_store.json). Overwrites persisted store and copies samples.")
 async def api_import_package(file: UploadFile = File(...)):
+	if getattr(helpers, 'FAST_MODE', False):
+		raise HTTPException(status_code=503, detail="Import disabled in FAST_MODE")
 	contents = await file.read()
 	if not contents:
 		raise HTTPException(status_code=400, detail="Empty upload")
