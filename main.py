@@ -8,7 +8,7 @@ import base64
 import time
 from typing import Optional, Dict, Any
 from pathlib import Path
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -204,7 +204,7 @@ def api_compare_features(sample: dict, user: dict):
 
 
 @app.post("/compare", summary="Compare user audio with sample (upload sample file or provide sample_id)")
-async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[UploadFile] = File(None), sample: Optional[UploadFile] = File(None), sample_id: Optional[str] = Form(None), background_tasks: BackgroundTasks = None):
+async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[UploadFile] = File(None), sample: Optional[UploadFile] = File(None), sample_id: Optional[str] = Form(None), background_tasks: BackgroundTasks = None): # pyright: ignore[reportUndefinedVariable]
     # Accept upload under either `user` or `file` field (client may send `file`)
     upload = user or file
     if not upload:
