@@ -262,6 +262,9 @@ def _build_match_entry(sample_id: str, meta: dict, ref_path: str, user_features:
 # In-memory task store (task_id -> meta)
 UPLOAD_TASKS: dict = {}
 
+# In-memory analysis task store (task_id -> meta/result)
+ANALYSIS_TASKS: dict = {}
+
 # Default upload limit (can be overridden per endpoint)
 DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB
 
@@ -359,6 +362,128 @@ def _enqueue_processing(task_id: str, src_path: str, original_filename: str, met
 				pass
 
 	executor.submit(job)
+
+
+def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mode: Optional[str] = None, sample_id: Optional[str] = None, vocab_id: Optional[str] = None, word: Optional[str] = None, timeout: int = 120, lesson_id: Optional[str] = None):
+	"""Submit an analysis job to the background executor and record result in ANALYSIS_TASKS."""
+
+	def job():
+		try:
+			# Default failure response
+			res = {"ok": False, "message": "No analysis performed"}
+
+			# Vocab mode: delegate to _handle_vocab_mode
+			if mode == "vocab":
+				out = _handle_vocab_mode(user_wav_path, vocab_id=vocab_id, word=word, timeout=timeout, created_tmp=created_tmp)
+				comment = out.get("advice") or out.get("transcript") or out.get("predict") or out.get("message")
+				feedback = None
+				if out.get("score") is not None:
+					try:
+						s = float(out.get("score"))
+						if 0.0 <= s <= 1.0:
+							feedback = _get_feedback(s * 100)
+						else:
+							feedback = _get_feedback(s)
+					except Exception:
+						feedback = None
+				res = {"ok": bool(out.get("success", False))}
+				if comment is not None:
+					res["comment"] = comment
+				if feedback:
+					res["feedback"] = feedback
+				res["raw"] = out
+				ANALYSIS_TASKS[task_id]["status"] = "done"
+				ANALYSIS_TASKS[task_id]["result"] = res
+				return
+
+			# If sample_id provided: compare against reference
+			if sample_id:
+				try:
+					helpers.load_persisted_store()
+					sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
+					if not sample_meta:
+						res = {"ok": False, "message": f"Reference sample '{sample_id}' not found"}
+					else:
+						ref_filename = sample_meta.get("filename")
+						ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
+						if not os.path.exists(ref_path):
+							res = {"ok": False, "message": f"Reference audio file not found: {ref_filename}"}
+						else:
+							user_features = _extract_features_with_timeout(user_wav_path, timeout=max(5, int(timeout)))
+							ref_features = _extract_features_with_timeout(ref_path, timeout=max(5, int(timeout)))
+							mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
+							mfcc_score = max(0, 100 - mfcc_dist * 2)
+							pitch_score = max(0, 100 - pitch_diff * 0.5)
+							tempo_score = max(0, 100 - tempo_diff * 0.5)
+							overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
+							res = {"ok": True, "comment": _get_review(overall_score, mfcc_dist, pitch_diff, tempo_diff), "feedback": _get_feedback(overall_score)}
+				except Exception as e:
+					res = {"ok": False, "message": f"Feature extraction/compare failed: {e}"}
+
+				ANALYSIS_TASKS[task_id]["status"] = "done"
+				ANALYSIS_TASKS[task_id]["result"] = res
+				return
+
+			# Otherwise: auto-detect across all samples
+			try:
+				user_features = _extract_features_with_timeout(user_wav_path, timeout=max(5, int(timeout)))
+				helpers.load_persisted_store()
+				samples_meta = helpers.PERSISTED_STORE.get("samples", {})
+				candidates = []
+				for s_id, meta in samples_meta.items():
+					if lesson_id and meta.get("lesson_id") != lesson_id:
+						continue
+					ref_filename = meta.get("filename")
+					if not ref_filename:
+						continue
+					ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
+					if not os.path.exists(ref_path):
+						continue
+					candidates.append((s_id, meta, ref_path))
+
+				matches = []
+				if candidates:
+					max_workers = min(8, len(candidates))
+					with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
+						futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, user_features) for (s_id, meta, ref_path) in candidates]
+						for fut in as_completed(futures):
+							try:
+								r = fut.result()
+								if r:
+									matches.append(r)
+							except Exception:
+								continue
+
+				if not matches:
+					res = {"ok": False, "message": "No matching samples found"}
+				else:
+					matches.sort(key=lambda x: x["overall_score"], reverse=True)
+					best = matches[0]
+					res = {"ok": True, "comment": _get_review(best["overall_score"], best.get("details", {}).get("mfcc_distance"), best.get("details", {}).get("pitch_difference_hz"), best.get("details", {}).get("tempo_difference_bpm")), "feedback": _get_feedback(best["overall_score"]) }
+			except Exception as e:
+				res = {"ok": False, "message": f"Analysis failed: {e}"}
+
+			ANALYSIS_TASKS[task_id]["status"] = "done"
+			ANALYSIS_TASKS[task_id]["result"] = res
+		except Exception as e:
+			ANALYSIS_TASKS[task_id]["status"] = "error"
+			ANALYSIS_TASKS[task_id]["error"] = str(e)
+		finally:
+			try:
+				if created_tmp and user_wav_path and os.path.exists(user_wav_path):
+					os.remove(user_wav_path)
+			except Exception:
+				pass
+
+	executor.submit(job)
+
+
+@router.get("/analyze/status/{task_id}")
+def api_analyze_status(task_id: str):
+	t = ANALYSIS_TASKS.get(task_id)
+	if not t:
+		raise HTTPException(status_code=404, detail="Task not found")
+	return {"task_id": task_id, **t}
 
 
 # -------------------------
@@ -786,7 +911,8 @@ def api_get_vocab_store(lesson_id: str):
 async def api_analyze_compare(
 	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
 	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
-	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)")
+	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)"),
+	background: Optional[bool] = Form(False, description="If true, run analysis in background and return task_id"),
 ):
 	"""
 	Upload user audio and compare with a reference sample.
@@ -873,6 +999,13 @@ async def api_analyze_compare(
 				pass
 			return _default_compare_response(f"Reference audio file not found: {ref_filename}")
 
+		# If requested, run analysis in background and return task_id
+		if background:
+			task_id = str(uuid.uuid4())
+			ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
+			_enqueue_analysis(task_id, user_wav_path, created_tmp, sample_id=sample_id, timeout=60)
+			return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
+
 		# Extract features and compare
 		# Extract features with process pool and timeout to avoid blocking
 		# api_analyze_compare does not accept a user-provided `timeout` field;
@@ -942,6 +1075,7 @@ async def api_analyze(
 	vocab_id: Optional[str] = Form(None, description="Vocab id when mode='vocab'"),
 	word: Optional[str] = Form(None, description="Optional target word text"),
 	timeout: Optional[int] = Form(120, description="Timeout seconds for processing (default 120)"),
+	background: Optional[bool] = Form(False, description="If true, run analysis in background and return task_id"),
 ):
 	"""
 	Compatibility endpoint that either compares uploaded user audio against a
@@ -1030,6 +1164,13 @@ async def api_analyze(
 				except Exception:
 					feedback = None
 			return _as_review_response(res.get("success", False), comment=comment, feedback=feedback, message=res.get("message"))
+
+		# If requested, run analysis in background and return task_id
+		if background:
+			task_id = str(uuid.uuid4())
+			ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
+			_enqueue_analysis(task_id, user_wav_path, created_tmp, mode=mode, sample_id=sample_id, vocab_id=vocab_id, word=word, timeout=int(timeout or 120))
+			return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
 
 		if sample_id:
 			helpers.load_persisted_store()
@@ -1450,7 +1591,8 @@ def _handle_vocab_mode(user_wav_path: str, vocab_id: Optional[str], word: Option
 async def api_analyze_auto(
 	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
 	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
-	lesson_id: Optional[str] = Form(None, description="Optional: filter by lesson ID")
+	lesson_id: Optional[str] = Form(None, description="Optional: filter by lesson ID"),
+	background: Optional[bool] = Form(False, description="If true, run analysis in background and return task_id")
 ):
 	"""
 	Upload audio and automatically detect which word the user is pronouncing.
@@ -1511,6 +1653,13 @@ async def api_analyze_auto(
 					except Exception:
 						pass
 					return _default_auto_response("Audio conversion failed")
+
+		# If background requested, enqueue analysis job and return task_id
+		if background:
+			task_id = str(uuid.uuid4())
+			ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
+			_enqueue_analysis(task_id, user_wav_path, created_tmp, timeout=60, lesson_id=lesson_id)
+			return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
 
 		try:
 			user_features = _extract_features_with_timeout(user_wav_path, timeout=60)
@@ -1590,7 +1739,8 @@ async def api_analyze_vocab(
 	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
 	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
 	vocab_id: str = Form(..., description="Vocab ID to restrict comparison to"),
-	lesson_id: Optional[str] = Form(None, description="Optional: lesson ID to further filter samples")
+	lesson_id: Optional[str] = Form(None, description="Optional: lesson ID to further filter samples"),
+	background: Optional[bool] = Form(False, description="If true, run analysis in background and return task_id")
 ):
 	"""
 	Compare uploaded user audio only against samples that are linked to `vocab_id`.
@@ -1669,6 +1819,13 @@ async def api_analyze_vocab(
 			except Exception:
 				pass
 			raise HTTPException(status_code=404, detail=f"No samples found for vocab_id={vocab_id}")
+
+		# If background requested, enqueue job and return task_id
+		if background:
+			task_id = str(uuid.uuid4())
+			ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
+			_enqueue_analysis(task_id, user_wav_path, created_tmp, vocab_id=vocab_id, timeout=60, lesson_id=lesson_id)
+			return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
 
 		# Extract user features
 		try:
