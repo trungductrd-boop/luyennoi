@@ -14,6 +14,37 @@ import wave as _wave
 import helpers
 from pydantic import BaseModel, field_validator
 
+# Redis-backed job helpers (use when running multiple workers)
+import json as _json
+import redis as _redis
+
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_DB = int(os.getenv("REDIS_DB", 0))
+
+redis_client = _redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+
+JOB_TTL = int(os.getenv("JOB_TTL", 300))  # seconds
+
+def job_key(job_id: str) -> str:
+	return f"job:{job_id}"
+
+def job_set(job_id: str, data: dict, ttl: int = JOB_TTL):
+	try:
+		redis_client.setex(job_key(job_id), ttl, _json.dumps(data))
+	except Exception:
+		# best-effort: ignore redis errors to avoid crashing
+		pass
+
+def job_get(job_id: str):
+	try:
+		raw = redis_client.get(job_key(job_id))
+		if not raw:
+			return None
+		return _json.loads(raw)
+	except Exception:
+		return None
+
 router = APIRouter()
 
 # Constants for streaming
@@ -265,8 +296,7 @@ UPLOAD_TASKS: dict = {}
 # In-memory analysis task store (task_id -> meta/result)
 ANALYSIS_TASKS: dict = {}
 
-# Unified job store (in-memory). Can be replaced by Redis if needed.
-JOB_STORE: dict = {}
+# NOTE: replaced in-memory JOB_STORE with Redis-backed helpers (see job_set/job_get)
 
 # Default upload limit (can be overridden per endpoint)
 DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB
@@ -357,7 +387,7 @@ def _enqueue_processing(task_id: str, src_path: str, original_filename: str, met
 			UPLOAD_TASKS[task_id]["filename"] = os.path.basename(dst_path)
 			# Update unified job store
 			try:
-				JOB_STORE[task_id] = {"status": "done", "result": dict(UPLOAD_TASKS.get(task_id, {}))}
+				job_set(task_id, {"status": "done", "result": dict(UPLOAD_TASKS.get(task_id, {}))})
 			except Exception:
 				pass
 		except Exception as e:
@@ -365,7 +395,7 @@ def _enqueue_processing(task_id: str, src_path: str, original_filename: str, met
 			UPLOAD_TASKS[task_id]["error"] = str(e)
 			# Update unified job store on error
 			try:
-				JOB_STORE[task_id] = {"status": "error", "error": str(e)}
+				job_set(task_id, {"status": "error", "error": str(e)})
 			except Exception:
 				pass
 		finally:
@@ -396,7 +426,7 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 				ANALYSIS_TASKS[task_id]["error"] = f"Conversion failed: {e}"
 				# Ensure unified job store marks error too
 				try:
-					JOB_STORE[task_id] = {"status": "error", "error": f"Conversion failed: {e}"}
+					job_set(task_id, {"status": "error", "error": f"Conversion failed: {e}"})
 				except Exception:
 					pass
 				return
@@ -428,7 +458,7 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 				ANALYSIS_TASKS[task_id]["result"] = res
 				# Update unified job store
 				try:
-					JOB_STORE[task_id] = {"status": "done", "result": res}
+					job_set(task_id, {"status": "done", "result": res})
 				except Exception:
 					pass
 				return
@@ -461,7 +491,7 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 				ANALYSIS_TASKS[task_id]["result"] = res
 				# Update unified job store
 				try:
-					JOB_STORE[task_id] = {"status": "done", "result": res}
+					job_set(task_id, {"status": "done", "result": res})
 				except Exception:
 					pass
 				return
@@ -509,7 +539,7 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 			ANALYSIS_TASKS[task_id]["result"] = res
 			# Update unified job store
 			try:
-				JOB_STORE[task_id] = {"status": "done", "result": res}
+				job_set(task_id, {"status": "done", "result": res})
 			except Exception:
 				pass
 		except Exception as e:
@@ -517,7 +547,7 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 				ANALYSIS_TASKS[task_id]["error"] = str(e)
 				# Update unified job store with error
 				try:
-					JOB_STORE[task_id] = {"status": "error", "error": str(e)}
+					job_set(task_id, {"status": "error", "error": str(e)})
 				except Exception:
 					pass
 		finally:
@@ -548,9 +578,12 @@ def api_analyze_status(task_id: str):
 @router.get("/status/{job_id}")
 def api_status(job_id: str):
 	"""Unified job status endpoint (never returns 404).
-	Returns job info from `JOB_STORE` or `{"status": "not_found"}`.
+	Returns job info from Redis-backed store or {"status":"not_found"}.
 	"""
-	return JOB_STORE.get(job_id, {"status": "not_found"})
+	j = job_get(job_id)
+	if not j:
+		return {"status": "not_found"}
+	return j
 
 
 # -------------------------
@@ -641,7 +674,7 @@ async def api_upload(
 	}
 
 	# Add to unified job store so external callers can poll /status/{job_id}
-	JOB_STORE[job_id] = {"status": "processing", "type": "upload", "created_at": time.time()}
+	job_set(job_id, {"status": "processing", "type": "upload", "created_at": time.time()})
 
 	# Enqueue background processing
 	_enqueue_processing(job_id, tmp_path, file.filename, {"lesson_id": lesson_id, **meta_obj})
@@ -654,7 +687,7 @@ def api_upload_status(task_id: str):
 	t = UPLOAD_TASKS.get(task_id)
 	if not t:
 		raise HTTPException(status_code=404, detail="Task not found")
-	return {"jod_id": task_id, **t}
+	return {"task_id": task_id, **t}
 
 
 class VocabItemIn(BaseModel):
@@ -1078,8 +1111,8 @@ async def api_analyze_compare(
 				return _default_compare_response("No reference sample_id provided")
 				job_id = str(uuid.uuid4())
 				ANALYSIS_TASKS[job_id] = {"status": "queued", "created_at": time.time(), "result": None}
-				# record in unified JOB_STORE for external polling
-				JOB_STORE[job_id] = {"status": "processing", "type": "analysis", "created_at": time.time()}
+				# record in unified job store for external polling
+				job_set(job_id, {"status": "processing", "type": "analysis", "created_at": time.time()})
 				_enqueue_analysis(job_id, user_raw_path, True, sample_id=sample_id, timeout=60)
 				return JSONResponse(status_code=202, content={"status": "accepted", "job_id": job_id, "message": "processing"})
 		# If WAV and already 16k mono, skip conversion
@@ -1244,8 +1277,8 @@ async def api_analyze(
 				if background:
 					job_id = str(uuid.uuid4())
 					ANALYSIS_TASKS[job_id] = {"status": "queued", "created_at": time.time(), "result": None}
-					# record in unified JOB_STORE for external polling
-					JOB_STORE[job_id] = {"status": "processing", "type": "analysis", "created_at": time.time()}
+					# record in unified job store for external polling
+					job_set(job_id, {"status": "processing", "type": "analysis", "created_at": time.time()})
 					_enqueue_analysis(job_id, user_raw_path, True, timeout=60)
 					return JSONResponse(status_code=202, content={"status": "accepted", "job_id": job_id, "message": "processing"})
 
