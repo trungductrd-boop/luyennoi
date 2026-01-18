@@ -368,13 +368,27 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 	"""Submit an analysis job to the background executor and record result in ANALYSIS_TASKS."""
 
 	def job():
+		# Task started
 		try:
+			if hasattr(helpers, 'logger'):
+				helpers.logger.info(f"ANALYSIS task {task_id} started")
+			else:
+				print(f"ANALYSIS task {task_id} started")
+
+			# Ensure we have a WAV 16k mono path for processing (may convert)
+			try:
+				use_path, conv_created = _ensure_wav16_mono(user_wav_path)
+			except Exception as e:
+				ANALYSIS_TASKS[task_id]["status"] = "error"
+				ANALYSIS_TASKS[task_id]["error"] = f"Conversion failed: {e}"
+				return
+
 			# Default failure response
 			res = {"ok": False, "message": "No analysis performed"}
 
 			# Vocab mode: delegate to _handle_vocab_mode
 			if mode == "vocab":
-				out = _handle_vocab_mode(user_wav_path, vocab_id=vocab_id, word=word, timeout=timeout, created_tmp=created_tmp)
+				out = _handle_vocab_mode(use_path, vocab_id=vocab_id, word=word, timeout=timeout, created_tmp=conv_created or created_tmp)
 				comment = out.get("advice") or out.get("transcript") or out.get("predict") or out.get("message")
 				feedback = None
 				if out.get("score") is not None:
@@ -409,7 +423,7 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 						if not os.path.exists(ref_path):
 							res = {"ok": False, "message": f"Reference audio file not found: {ref_filename}"}
 						else:
-							user_features = _extract_features_with_timeout(user_wav_path, timeout=max(5, int(timeout)))
+							user_features = _extract_features_with_timeout(use_path, timeout=max(5, int(timeout)))
 							ref_features = _extract_features_with_timeout(ref_path, timeout=max(5, int(timeout)))
 							mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
 							mfcc_score = max(0, 100 - mfcc_dist * 2)
@@ -426,7 +440,7 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 
 			# Otherwise: auto-detect across all samples
 			try:
-				user_features = _extract_features_with_timeout(user_wav_path, timeout=max(5, int(timeout)))
+				user_features = _extract_features_with_timeout(use_path, timeout=max(5, int(timeout)))
 				helpers.load_persisted_store()
 				samples_meta = helpers.PERSISTED_STORE.get("samples", {})
 				candidates = []
@@ -469,11 +483,18 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 			ANALYSIS_TASKS[task_id]["status"] = "error"
 			ANALYSIS_TASKS[task_id]["error"] = str(e)
 		finally:
-			try:
-				if created_tmp and user_wav_path and os.path.exists(user_wav_path):
-					os.remove(user_wav_path)
-			except Exception:
-				pass
+				# cleanup: remove converted tmp and/or original raw if needed
+				try:
+					# remove converted file if created by conversion
+					if 'use_path' in locals() and 'conv_created' in locals() and conv_created and use_path and os.path.exists(use_path):
+						os.remove(use_path)
+				except Exception:
+					pass
+				try:
+					if created_tmp and user_wav_path and os.path.exists(user_wav_path):
+						os.remove(user_wav_path)
+				except Exception:
+					pass
 
 	executor.submit(job)
 
@@ -941,6 +962,29 @@ async def api_analyze_compare(
 		with open(user_raw_path, "wb") as f:
 			f.write(user_contents)
 		user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
+
+		# If synchronous request requires a sample_id, validate early
+		if not background and not sample_id:
+			try:
+				if os.path.exists(user_raw_path):
+					os.remove(user_raw_path)
+			except Exception:
+				pass
+			return _default_compare_response("No reference sample_id provided")
+
+		# If requested, run analysis in background and return task_id (do not convert now)
+		if background:
+			if not sample_id:
+				try:
+					if os.path.exists(user_raw_path):
+						os.remove(user_raw_path)
+				except Exception:
+					pass
+				return _default_compare_response("No reference sample_id provided")
+			task_id = str(uuid.uuid4())
+			ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
+			_enqueue_analysis(task_id, user_raw_path, True, sample_id=sample_id, timeout=60)
+			return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
 		# If WAV and already 16k mono, skip conversion
 		try:
 			skip_conv = False
@@ -969,15 +1013,6 @@ async def api_analyze_compare(
 				pass
 			return _default_compare_response("Audio conversion failed")
 
-		# sample_id must be provided for explicit compare
-		if not sample_id:
-			try:
-				if created_tmp and user_wav_path and os.path.exists(user_wav_path):
-					os.remove(user_wav_path)
-			except Exception:
-				pass
-			return _default_compare_response("No reference sample_id provided")
-
 		# Load reference
 		helpers.load_persisted_store()
 		sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
@@ -999,12 +1034,6 @@ async def api_analyze_compare(
 				pass
 			return _default_compare_response(f"Reference audio file not found: {ref_filename}")
 
-		# If requested, run analysis in background and return task_id
-		if background:
-			task_id = str(uuid.uuid4())
-			ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
-			_enqueue_analysis(task_id, user_wav_path, created_tmp, sample_id=sample_id, timeout=60)
-			return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
 
 		# Extract features and compare
 		# Extract features with process pool and timeout to avoid blocking
@@ -1113,6 +1142,14 @@ async def api_analyze(
 				with open(user_raw_path, "wb") as f:
 					f.write(user_contents)
 				user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
+
+				# If requested, run analysis in background and return task_id (do not convert now)
+				if background:
+					task_id = str(uuid.uuid4())
+					ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
+					_enqueue_analysis(task_id, user_raw_path, True, timeout=60, lesson_id=lesson_id)
+					return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
+
 				# If WAV and already 16k mono, skip conversion
 				try:
 					skip_conv = False
@@ -1165,12 +1202,7 @@ async def api_analyze(
 					feedback = None
 			return _as_review_response(res.get("success", False), comment=comment, feedback=feedback, message=res.get("message"))
 
-		# If requested, run analysis in background and return task_id
-		if background:
-			task_id = str(uuid.uuid4())
-			ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
-			_enqueue_analysis(task_id, user_wav_path, created_tmp, mode=mode, sample_id=sample_id, vocab_id=vocab_id, word=word, timeout=int(timeout or 120))
-			return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
+
 
 		if sample_id:
 			helpers.load_persisted_store()
@@ -1654,13 +1686,6 @@ async def api_analyze_auto(
 						pass
 					return _default_auto_response("Audio conversion failed")
 
-		# If background requested, enqueue analysis job and return task_id
-		if background:
-			task_id = str(uuid.uuid4())
-			ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
-			_enqueue_analysis(task_id, user_wav_path, created_tmp, timeout=60, lesson_id=lesson_id)
-			return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
-
 		try:
 			user_features = _extract_features_with_timeout(user_wav_path, timeout=60)
 		except Exception as e:
@@ -1819,13 +1844,6 @@ async def api_analyze_vocab(
 			except Exception:
 				pass
 			raise HTTPException(status_code=404, detail=f"No samples found for vocab_id={vocab_id}")
-
-		# If background requested, enqueue job and return task_id
-		if background:
-			task_id = str(uuid.uuid4())
-			ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
-			_enqueue_analysis(task_id, user_wav_path, created_tmp, vocab_id=vocab_id, timeout=60, lesson_id=lesson_id)
-			return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
 
 		# Extract user features
 		try:
