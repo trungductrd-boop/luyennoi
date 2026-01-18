@@ -1147,7 +1147,7 @@ async def api_analyze(
 				if background:
 					task_id = str(uuid.uuid4())
 					ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
-					_enqueue_analysis(task_id, user_raw_path, True, timeout=60, lesson_id=lesson_id)
+					_enqueue_analysis(task_id, user_raw_path, True, timeout=60)
 					return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
 
 				# If WAV and already 16k mono, skip conversion
