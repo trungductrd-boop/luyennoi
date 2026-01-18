@@ -1,0 +1,22 @@
+# Minimal, Python 3.11 compatible requirements (recommended)
+# Install into a Python 3.11 virtualenv:
+# python3.11 -m venv .venv311
+# .venv311\Scripts\Activate.ps1
+# python -m pip install --upgrade pip setuptools wheel
+# python -m pip install -r requirements-py311.txt
+
+fastapi
+uvicorn
+redis
+
+# Audio / ML libs (ensure install order: numpy first)
+numpy>=1.24,<2.0
+scipy>=1.10
+librosa>=0.10
+numba>=0.58
+
+# Optional helpers commonly used by this project
+soundfile
+requests
+python-multipart
+pydantic
