@@ -265,6 +265,9 @@ UPLOAD_TASKS: dict = {}
 # In-memory analysis task store (task_id -> meta/result)
 ANALYSIS_TASKS: dict = {}
 
+# Unified job store (in-memory). Can be replaced by Redis if needed.
+JOB_STORE: dict = {}
+
 # Default upload limit (can be overridden per endpoint)
 DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB
 
@@ -352,9 +355,19 @@ def _enqueue_processing(task_id: str, src_path: str, original_filename: str, met
 			UPLOAD_TASKS[task_id]["status"] = "done"
 			UPLOAD_TASKS[task_id]["sample_id"] = sample_id
 			UPLOAD_TASKS[task_id]["filename"] = os.path.basename(dst_path)
+			# Update unified job store
+			try:
+				JOB_STORE[task_id] = {"status": "done", "result": dict(UPLOAD_TASKS.get(task_id, {}))}
+			except Exception:
+				pass
 		except Exception as e:
 			UPLOAD_TASKS[task_id]["status"] = "error"
 			UPLOAD_TASKS[task_id]["error"] = str(e)
+			# Update unified job store on error
+			try:
+				JOB_STORE[task_id] = {"status": "error", "error": str(e)}
+			except Exception:
+				pass
 		finally:
 			try:
 				os.remove(src_path)
@@ -381,6 +394,11 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 			except Exception as e:
 				ANALYSIS_TASKS[task_id]["status"] = "error"
 				ANALYSIS_TASKS[task_id]["error"] = f"Conversion failed: {e}"
+				# Ensure unified job store marks error too
+				try:
+					JOB_STORE[task_id] = {"status": "error", "error": f"Conversion failed: {e}"}
+				except Exception:
+					pass
 				return
 
 			# Default failure response
@@ -408,6 +426,11 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 				res["raw"] = out
 				ANALYSIS_TASKS[task_id]["status"] = "done"
 				ANALYSIS_TASKS[task_id]["result"] = res
+				# Update unified job store
+				try:
+					JOB_STORE[task_id] = {"status": "done", "result": res}
+				except Exception:
+					pass
 				return
 
 			# If sample_id provided: compare against reference
@@ -436,6 +459,11 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 
 				ANALYSIS_TASKS[task_id]["status"] = "done"
 				ANALYSIS_TASKS[task_id]["result"] = res
+				# Update unified job store
+				try:
+					JOB_STORE[task_id] = {"status": "done", "result": res}
+				except Exception:
+					pass
 				return
 
 			# Otherwise: auto-detect across all samples
@@ -479,9 +507,19 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 
 			ANALYSIS_TASKS[task_id]["status"] = "done"
 			ANALYSIS_TASKS[task_id]["result"] = res
+			# Update unified job store
+			try:
+				JOB_STORE[task_id] = {"status": "done", "result": res}
+			except Exception:
+				pass
 		except Exception as e:
-			ANALYSIS_TASKS[task_id]["status"] = "error"
-			ANALYSIS_TASKS[task_id]["error"] = str(e)
+				ANALYSIS_TASKS[task_id]["status"] = "error"
+				ANALYSIS_TASKS[task_id]["error"] = str(e)
+				# Update unified job store with error
+				try:
+					JOB_STORE[task_id] = {"status": "error", "error": str(e)}
+				except Exception:
+					pass
 		finally:
 				# cleanup: remove converted tmp and/or original raw if needed
 				try:
@@ -505,6 +543,14 @@ def api_analyze_status(task_id: str):
 	if not t:
 		raise HTTPException(status_code=404, detail="Task not found")
 	return {"task_id": task_id, **t}
+
+
+@router.get("/status/{job_id}")
+def api_status(job_id: str):
+	"""Unified job status endpoint (never returns 404).
+	Returns job info from `JOB_STORE` or `{"status": "not_found"}`.
+	"""
+	return JOB_STORE.get(job_id, {"status": "not_found"})
 
 
 # -------------------------
@@ -535,8 +581,8 @@ async def api_upload(
 
 	# Ensure temp dir
 	os.makedirs(helpers.TMP_DIR, exist_ok=True)
-	task_id = str(uuid.uuid4())
-	tmp_fname = f"upload_{task_id}.tmp"
+	job_id = str(uuid.uuid4())
+	tmp_fname = f"upload_{job_id}.tmp"
 	tmp_path = os.path.join(helpers.TMP_DIR, tmp_fname)
 
 	# Stream write
@@ -583,7 +629,7 @@ async def api_upload(
 			meta_obj = {"raw": metadata}
 
 	# Register task
-	UPLOAD_TASKS[task_id] = {
+	UPLOAD_TASKS[job_id] = {
 		"status": "queued",
 		"original_filename": file.filename,
 		"size": total,
@@ -594,18 +640,21 @@ async def api_upload(
 		"metadata": meta_obj,
 	}
 
+	# Add to unified job store so external callers can poll /status/{job_id}
+	JOB_STORE[job_id] = {"status": "processing", "type": "upload", "created_at": time.time()}
+
 	# Enqueue background processing
-	_enqueue_processing(task_id, tmp_path, file.filename, {"lesson_id": lesson_id, **meta_obj})
+	_enqueue_processing(job_id, tmp_path, file.filename, {"lesson_id": lesson_id, **meta_obj})
 
-	return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
+	return JSONResponse(status_code=202, content={"status": "accepted", "job_id": job_id, "message": "processing"})
 
 
-@router.get("/upload/status/{task_id}")
+@router.get("/upload/stjods/{task_id}")
 def api_upload_status(task_id: str):
 	t = UPLOAD_TASKS.get(task_id)
 	if not t:
 		raise HTTPException(status_code=404, detail="Task not found")
-	return {"task_id": task_id, **t}
+	return {"jod_id": task_id, **t}
 
 
 class VocabItemIn(BaseModel):
@@ -729,6 +778,52 @@ def api_samples_rescan():
 	except Exception:
 		pass
 	return {"ok": True, "report": report}
+
+
+@router.post("/samples/fix-extensions", summary="Fix .mp3 -> .wav references after bulk conversion")
+def api_samples_fix_extensions():
+	"""Scan persisted store and lessons, replacing `.mp3` filenames with `.wav`
+	when the corresponding `.wav` file exists in the samples directory.
+	Returns a small report of changes made.
+	"""
+	helpers.load_persisted_store()
+	samples = helpers.PERSISTED_STORE.setdefault("samples", {})
+	samples_updated = []
+
+	# Update samples entries
+	for sid, meta in list(samples.items()):
+		fn = meta.get("filename")
+		if not fn:
+			continue
+		if fn.lower().endswith(".mp3"):
+			base = os.path.splitext(fn)[0]
+			wav = f"{base}.wav"
+			wav_path = os.path.join(helpers.SAMPLES_DIR, wav)
+			if os.path.exists(wav_path):
+				meta["filename"] = wav
+				samples_updated.append({"sample_id": sid, "from": fn, "to": wav})
+
+	# Update persisted lesson/vocab audio_filename fields
+	lessons_updated = []
+	lessons_store = helpers.PERSISTED_STORE.setdefault("lessons", {})
+	for bucket, entries in lessons_store.items():
+		iterable = entries.values() if isinstance(entries, dict) else entries
+		for v in iterable:
+			if not isinstance(v, dict):
+				continue
+			af = v.get("audio_filename")
+			if af and af.lower().endswith(".mp3"):
+				base = os.path.splitext(af)[0]
+				wav = f"{base}.wav"
+				wav_path = os.path.join(helpers.SAMPLES_DIR, wav)
+				if os.path.exists(wav_path):
+					v["audio_filename"] = wav
+					lessons_updated.append({"lesson": bucket, "vocab_id": v.get("id"), "from": af, "to": wav})
+
+	# Persist changes
+	helpers.save_persisted_store()
+
+	return {"ok": True, "samples_updated": len(samples_updated), "lessons_updated": len(lessons_updated), "details": {"samples": samples_updated, "lessons": lessons_updated}}
 
 
 @router.post("/samples/link", summary="Link a sample to a lesson/vocab")
@@ -981,10 +1076,12 @@ async def api_analyze_compare(
 				except Exception:
 					pass
 				return _default_compare_response("No reference sample_id provided")
-			task_id = str(uuid.uuid4())
-			ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
-			_enqueue_analysis(task_id, user_raw_path, True, sample_id=sample_id, timeout=60)
-			return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
+				job_id = str(uuid.uuid4())
+				ANALYSIS_TASKS[job_id] = {"status": "queued", "created_at": time.time(), "result": None}
+				# record in unified JOB_STORE for external polling
+				JOB_STORE[job_id] = {"status": "processing", "type": "analysis", "created_at": time.time()}
+				_enqueue_analysis(job_id, user_raw_path, True, sample_id=sample_id, timeout=60)
+				return JSONResponse(status_code=202, content={"status": "accepted", "job_id": job_id, "message": "processing"})
 		# If WAV and already 16k mono, skip conversion
 		try:
 			skip_conv = False
@@ -1145,10 +1242,12 @@ async def api_analyze(
 
 				# If requested, run analysis in background and return task_id (do not convert now)
 				if background:
-					task_id = str(uuid.uuid4())
-					ANALYSIS_TASKS[task_id] = {"status": "queued", "created_at": time.time(), "result": None}
-					_enqueue_analysis(task_id, user_raw_path, True, timeout=60)
-					return JSONResponse(status_code=202, content={"status": "accepted", "task_id": task_id, "message": "processing"})
+					job_id = str(uuid.uuid4())
+					ANALYSIS_TASKS[job_id] = {"status": "queued", "created_at": time.time(), "result": None}
+					# record in unified JOB_STORE for external polling
+					JOB_STORE[job_id] = {"status": "processing", "type": "analysis", "created_at": time.time()}
+					_enqueue_analysis(job_id, user_raw_path, True, timeout=60)
+					return JSONResponse(status_code=202, content={"status": "accepted", "job_id": job_id, "message": "processing"})
 
 				# If WAV and already 16k mono, skip conversion
 				try:
