@@ -16,7 +16,7 @@ from pydantic import BaseModel, field_validator
 
 # Redis-backed job helpers (use when running multiple workers)
 import json as _json
-import redis as _redis
+import redis as _redis # pyright: ignore[reportMissingImports]
 
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
@@ -54,6 +54,19 @@ def job_get(job_id: str):
 					return JOB_STORE[job_id]
 			except Exception:
 				pass
+			# 2) check on-disk job file in helpers.TMP_DIR (fallback for file-based workers)
+			try:
+				jobs_dir = os.path.join(helpers.TMP_DIR, 'jobs')
+				jf = os.path.join(jobs_dir, f"{job_id}.json")
+				if os.path.exists(jf):
+					with open(jf, 'r', encoding='utf-8') as f:
+						try:
+							return _json.loads(f.read())
+						except Exception:
+							# if file is partially written, ignore and continue
+							pass
+			except Exception:
+				pass
 			# 2) check ANALYSIS_TASKS / UPLOAD_TASKS for legacy callers
 			try:
 				if job_id in ANALYSIS_TASKS:
@@ -76,6 +89,18 @@ def job_get(job_id: str):
 		try:
 			if job_id in JOB_STORE:
 				return JOB_STORE[job_id]
+		except Exception:
+			pass
+		# also attempt to read on-disk job file as a last resort
+		try:
+			jobs_dir = os.path.join(helpers.TMP_DIR, 'jobs')
+			jf = os.path.join(jobs_dir, f"{job_id}.json")
+			if os.path.exists(jf):
+				with open(jf, 'r', encoding='utf-8') as f:
+					try:
+						return _json.loads(f.read())
+					except Exception:
+						pass
 		except Exception:
 			pass
 		try:

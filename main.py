@@ -214,7 +214,7 @@ def api_compare_features(sample: dict, user: dict):
 
 
 @app.post("/compare", summary="Compare user audio with sample (upload sample file or provide sample_id)")
-async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[UploadFile] = File(None), sample: Optional[UploadFile] = File(None), sample_id: Optional[str] = Form(None), background_tasks: BackgroundTasks = None): # pyright: ignore[reportUndefinedVariable]
+async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[UploadFile] = File(None), sample: Optional[UploadFile] = File(None), sample_id: Optional[str] = Form(None), background_tasks: BackgroundTasks = None, wait: Optional[bool] = Form(False)): # pyright: ignore[reportUndefinedVariable]
     # Accept upload under either `user` or `file` field (client may send `file`)
     upload = user or file
     if not upload:
@@ -272,7 +272,27 @@ async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[Up
             except Exception:
                 pass
             raise HTTPException(status_code=404, detail=f"Sample file missing on server: {fn}")
-    # Create job and offload heavy work to background task
+    # If client requested synchronous handling, perform compare now and return result.
+    if wait:
+        if not (sample_path or sample_id):
+            try:
+                os.remove(user_temp_path)
+            except Exception:
+                pass
+            raise HTTPException(status_code=400, detail="Synchronous compare requires a sample file or sample_id")
+        try:
+            result = _compare_audio_paths(sample_path, user_temp_path, sample_uploaded_temp)
+            return result
+        except HTTPException:
+            raise
+        except Exception as e:
+            try:
+                os.remove(user_temp_path)
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"Synchronous compare failed: {e}")
+
+    # Create job and offload heavy work to background task (default behavior)
     job_id = uuid.uuid4().hex
     jobs_dir = os.path.join(helpers.TMP_DIR, "jobs")
     try:
