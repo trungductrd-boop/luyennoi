@@ -8,13 +8,14 @@ import base64
 import time
 from typing import Optional, Dict, Any
 from pathlib import Path
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response, BackgroundTasks
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response, BackgroundTasks, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 import uvicorn
 import gc
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import numpy as _np
@@ -72,6 +73,55 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 if os.path.exists(helpers.SAMPLES_DIR):
     app.mount("/samples", StaticFiles(directory=helpers.SAMPLES_DIR), name="samples")
 
+# In-memory map of job_id -> list of waiting WebSocket clients
+job_ws_clients: dict[str, list[WebSocket]] = {}
+
+# Main asyncio event loop reference (set on startup) so background threads
+# can schedule coroutines to notify websocket clients.
+MAIN_LOOP: asyncio.AbstractEventLoop | None = None
+
+
+@app.websocket("/ws/status/{job_id}")
+async def ws_job_status(ws: WebSocket, job_id: str):
+    await ws.accept()
+
+    job_ws_clients.setdefault(job_id, []).append(ws)
+
+    try:
+        while True:
+            # keep the connection alive; client may send pings
+            await ws.receive_text()
+    except WebSocketDisconnect:
+        try:
+            job_ws_clients[job_id].remove(ws)
+        except Exception:
+            pass
+
+
+async def notify_ws(job_id: str, result: dict):
+    clients = list(job_ws_clients.get(job_id, []))
+    for ws in clients:
+        try:
+            await ws.send_json(result)
+        except Exception:
+            try:
+                job_ws_clients.get(job_id, []).remove(ws)
+            except Exception:
+                pass
+
+
+def schedule_notify_ws(job_id: str, result: dict):
+    """Schedule notify_ws coroutine on the main event loop from sync/background threads."""
+    try:
+        loop = MAIN_LOOP
+        if loop:
+            try:
+                asyncio.run_coroutine_threadsafe(notify_ws(job_id, result), loop)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
 
 def get_local_ip() -> Optional[str]:
     try:
@@ -99,6 +149,13 @@ async def startup_event():
     """Initialize on startup"""
     # Load persisted store in all workers so in-memory data is available
     helpers.load_persisted_store()
+
+    # Capture the running event loop so background threads can schedule coroutines
+    try:
+        global MAIN_LOOP
+        MAIN_LOOP = asyncio.get_event_loop()
+    except Exception:
+        pass
 
     # Attempt to become the leader to run rescan/save (non-blocking lock)
     leader_lock_path = helpers.VOCAB_STORE_FILE + ".leader.lock"
@@ -723,7 +780,12 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
             # Perform compare using existing helper (handles conversion & cleanup)
             try:
                 result = _compare_audio_paths(sample_path, user_temp_path, sample_uploaded_temp)
-                _save_job_result(job_id, {"status": "done", "result": result})
+                payload = {"status": "done", "result": result}
+                _save_job_result(job_id, payload)
+                try:
+                    schedule_notify_ws(job_id, payload)
+                except Exception:
+                    pass
                 saved = True
                 return
             except HTTPException as he:
@@ -814,7 +876,12 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
                     "features_sample": f1,
                     "features_user": f2,
                 }
-                _save_job_result(job_id, {"status": "done", "result": resp})
+                payload = {"status": "done", "result": resp}
+                _save_job_result(job_id, payload)
+                try:
+                    schedule_notify_ws(job_id, payload)
+                except Exception:
+                    pass
                 saved = True
                 return
 
@@ -900,7 +967,12 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
                 "features_sample": best_features,
                 "features_user": f2,
             }
-            _save_job_result(job_id, {"status": "done", "result": resp})
+            payload = {"status": "done", "result": resp}
+            _save_job_result(job_id, payload)
+            try:
+                schedule_notify_ws(job_id, payload)
+            except Exception:
+                pass
             saved = True
             return
 
@@ -937,6 +1009,24 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
                     _save_job_result(job_id, {"status": "error", "error": "worker-exited-without-saving"})
         except Exception:
             pass
+
+
+# TEST-ONLY: trigger notify for a job_id with provided JSON payload.
+# This endpoint is intended for local manual testing and should be removed
+# or protected in production.
+@app.post("/__test_notify/{job_id}")
+async def _test_notify(job_id: str, payload: dict):
+    try:
+        data = {"status": "done", "result": payload}
+        _save_job_result(job_id, data)
+        # schedule notify on MAIN_LOOP
+        try:
+            schedule_notify_ws(job_id, data)
+        except Exception:
+            pass
+        return {"notified": True}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/result/{job_id}")
