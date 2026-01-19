@@ -16,6 +16,7 @@ from pydantic import BaseModel
 import uvicorn
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 try:
     import portalocker
 except Exception:
@@ -127,6 +128,14 @@ async def startup_event():
         # portalocker not available: do NOT run rescan here to avoid duplicated writes across workers.
         helpers.logger.warning("portalocker not installed; skipping rescan at startup to avoid writes")
     helpers.logger.info("Server started successfully")
+    # Start job scanner to heal stale 'processing' jobs (multi-instance safety)
+    try:
+        # Start in a daemon thread so it won't block shutdown
+        t = threading.Thread(target=_job_scanner_loop, daemon=True)
+        t.start()
+        helpers.logger.info("Job scanner thread started (pid=%d)", os.getpid())
+    except Exception:
+        helpers.logger.warning("Failed to start job scanner thread")
     # NOTE: Do NOT warm the entire sample cache at startup. Warming all samples
     # can consume large amounts of RAM and cause issues on constrained hosts
     # (Render free). Warm cache on-demand (via admin endpoint or after rescan).
@@ -517,6 +526,30 @@ def _save_job_result(job_id: str, payload: dict):
             # If writing tmp failed, attempt best-effort direct write
             with open(jf, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
+        # Propagate to centralized job store (Redis) if audio_api.job_set available
+        try:
+            try:
+                import audio_api as _audio_api
+                if hasattr(_audio_api, 'job_set'):
+                    _audio_api.job_set(job_id, payload)
+            except Exception:
+                pass
+        except Exception:
+            pass
+        # Log important lifecycle events so operator can trace jobs
+        try:
+            st = payload.get("status") if isinstance(payload, dict) else None
+            if st == "done":
+                helpers.logger.info("JOB DONE job_id=%s", job_id)
+            elif st == "error":
+                # include error message if available
+                try:
+                    err = payload.get("error") or payload.get("message")
+                except Exception:
+                    err = None
+                helpers.logger.error("JOB ERROR job_id=%s error=%s", job_id, err)
+        except Exception:
+            pass
     except Exception:
         try:
             helpers.logger.exception("Failed to save job result: %s", job_id)
@@ -526,6 +559,15 @@ def _save_job_result(job_id: str, payload: dict):
 
 def _load_job_result(job_id: str) -> Optional[dict]:
     try:
+        # First prefer centralized store (Redis) if available to support multi-instance
+        try:
+            import audio_api as _audio_api
+            j = _audio_api.job_get(job_id)
+            if j:
+                return j
+        except Exception:
+            pass
+
         jf = _job_file_path(job_id)
         if not os.path.exists(jf):
             return None
@@ -555,8 +597,61 @@ def _load_job_result(job_id: str) -> Optional[dict]:
         return None
 
 
+def _job_scanner_loop():
+    """Background loop that scans local job files and heals stale 'processing' jobs.
+
+    Marks jobs as error if they've been in 'processing' state longer than JOB_STALE_SECONDS.
+    This helps in multi-instance deployments where a worker may die before persisting final state.
+    """
+    try:
+        STALE = int(os.environ.get("JOB_STALE_SECONDS", "600"))
+        INTERVAL = int(os.environ.get("JOB_SCAN_INTERVAL", "60"))
+    except Exception:
+        STALE = 600
+        INTERVAL = 60
+
+    jobs_dir = os.path.join(helpers.TMP_DIR, "jobs")
+    while True:
+        try:
+            if not os.path.isdir(jobs_dir):
+                time.sleep(INTERVAL)
+                continue
+            for fname in os.listdir(jobs_dir):
+                if not fname.endswith('.json'):
+                    continue
+                jid = fname[:-5]
+                try:
+                    data = _load_job_result(jid)
+                    # If centralized store reports done/error, skip
+                    if not data:
+                        continue
+                    status = data.get('status') if isinstance(data, dict) else None
+                    if status == 'processing':
+                        created = data.get('created') or data.get('created_at') or 0
+                        try:
+                            created = float(created)
+                        except Exception:
+                            created = 0
+                        age = time.time() - created if created else None
+                        if age is not None and age > STALE:
+                            helpers.logger.warning("Job scanner: marking stale job %s as error (age=%s)", jid, age)
+                            _save_job_result(jid, {"status": "error", "error": "stale-job-marked-error"})
+                except Exception:
+                    continue
+        except Exception:
+            try:
+                helpers.logger.exception("Job scanner loop error")
+            except Exception:
+                pass
+        try:
+            time.sleep(INTERVAL)
+        except Exception:
+            break
+
+
 def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_uploaded_temp: bool, sample_id: Optional[str], job_id: str):
     """Background worker that performs the heavy compare work and writes job result file."""
+    saved = False
     try:
         # If a sample_path or sample_id was provided, prefer direct compare via helper
         if sample_path or sample_id:
@@ -567,6 +662,7 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
                     sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
                     if not sample_meta:
                         _save_job_result(job_id, {"status": "error", "error": "sample_id not found"})
+                        saved = True
                         try:
                             os.remove(user_temp_path)
                         except Exception:
@@ -575,6 +671,7 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
                     fn = sample_meta.get("filename")
                     if not fn:
                         _save_job_result(job_id, {"status": "error", "error": "sample file missing for sample_id"})
+                        saved = True
                         try:
                             os.remove(user_temp_path)
                         except Exception:
@@ -583,6 +680,7 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
                     sample_path = os.path.join(helpers.SAMPLES_DIR, fn)
                 except Exception as e:
                     _save_job_result(job_id, {"status": "error", "error": str(e)})
+                    saved = True
                     try:
                         os.remove(user_temp_path)
                     except Exception:
@@ -593,9 +691,11 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
             try:
                 result = _compare_audio_paths(sample_path, user_temp_path, sample_uploaded_temp)
                 _save_job_result(job_id, {"status": "done", "result": result})
+                saved = True
                 return
             except HTTPException as he:
                 _save_job_result(job_id, {"status": "error", "error": he.detail, "code": he.status_code})
+                saved = True
                 return
 
         # Otherwise, perform auto-match flow (no sample provided)
@@ -608,6 +708,7 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
             except Exception:
                 pass
             _save_job_result(job_id, {"status": "error", "error": f"conversion_failed: {e}"})
+            saved = True
             return
 
         try:
@@ -620,6 +721,7 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
                 except Exception:
                     pass
             _save_job_result(job_id, {"status": "error", "error": f"feature_extraction_failed: {e}"})
+            saved = True
             return
 
         try:
@@ -643,6 +745,7 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
                 sample_path = os.path.join(helpers.SAMPLES_DIR, fn) if fn else None
                 if not sample_path or not os.path.exists(sample_path):
                     _save_job_result(job_id, {"status": "error", "error": "matched sample file missing"})
+                    saved = True
                     try:
                         os.remove(user_temp_path)
                     except Exception:
@@ -679,6 +782,7 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
                     "features_user": f2,
                 }
                 _save_job_result(job_id, {"status": "done", "result": resp})
+                saved = True
                 return
 
             # Build candidates and compare in parallel
@@ -715,6 +819,7 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
 
             if not matches:
                 _save_job_result(job_id, {"status": "error", "error": "no_matching_sample_found"})
+                saved = True
                 return
 
             matches.sort(key=lambda x: x.get("overall_score", 0), reverse=True)
@@ -763,10 +868,12 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
                 "features_user": f2,
             }
             _save_job_result(job_id, {"status": "done", "result": resp})
+            saved = True
             return
 
         except Exception as e:
             _save_job_result(job_id, {"status": "error", "error": str(e)})
+            saved = True
             try:
                 os.remove(user_temp_path)
             except Exception:
@@ -775,7 +882,26 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
 
     except Exception as e:
         try:
+            # Log exception with stacktrace for operator visibility
+            try:
+                helpers.logger.exception("JOB FAILED job_id=%s", job_id)
+            except Exception:
+                pass
             _save_job_result(job_id, {"status": "error", "error": str(e)})
+        except Exception:
+            pass
+        saved = True
+    finally:
+        # Final-guard: if the job completed the heavy work but failed to persist
+        # a final state (e.g., process returned early or an unexpected path),
+        # ensure we do not leave the job in 'processing' forever.
+        try:
+            if not saved:
+                cur = _load_job_result(job_id)
+                # If no data or still processing, mark as error to unblock clients
+                if not cur or (isinstance(cur, dict) and cur.get("status") == "processing"):
+                    helpers.logger.warning("Final-guard: job %s exited without saving; marking as error", job_id)
+                    _save_job_result(job_id, {"status": "error", "error": "worker-exited-without-saving"})
         except Exception:
             pass
 
