@@ -499,11 +499,26 @@ def _job_file_path(job_id: str) -> str:
 def _save_job_result(job_id: str, payload: dict):
     try:
         jf = _job_file_path(job_id)
-        with open(jf, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
+        dirn = os.path.dirname(jf) or '.'
+        tmp_path = os.path.join(dirn, f".{job_id}.tmp")
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+                f.flush()
+                try:
+                    os.fsync(f.fileno())
+                except Exception:
+                    helpers.logger.debug("fsync not available or failed for %s", tmp_path)
+            try:
+                os.replace(tmp_path, jf)
+            except Exception:
+                os.rename(tmp_path, jf)
+        except Exception:
+            # If writing tmp failed, attempt best-effort direct write
+            with open(jf, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
     except Exception:
         try:
-            # best-effort logging
             helpers.logger.exception("Failed to save job result: %s", job_id)
         except Exception:
             pass
@@ -514,8 +529,28 @@ def _load_job_result(job_id: str) -> Optional[dict]:
         jf = _job_file_path(job_id)
         if not os.path.exists(jf):
             return None
-        with open(jf, "r", encoding="utf-8") as f:
-            return json.load(f)
+        # Retry on JSON decode errors (partial write) before treating as processing
+        attempts = 3
+        for i in range(attempts):
+            try:
+                with open(jf, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                try:
+                    helpers.logger.warning("Partial/invalid job file read for %s, attempt %d/%d", job_id, i+1, attempts)
+                except Exception:
+                    pass
+                try:
+                    import time
+                    time.sleep(0.05)
+                except Exception:
+                    pass
+                continue
+        try:
+            helpers.logger.warning("Job file %s appears incomplete; treating as processing", jf)
+        except Exception:
+            pass
+        return {"status": "processing"}
     except Exception:
         return None
 
