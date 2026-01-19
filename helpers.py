@@ -13,7 +13,7 @@ import unicodedata
  
 # Optional memory logging helper
 try:
-    import psutil
+    import psutil  # type: ignore
 except Exception:
     psutil = None
 
