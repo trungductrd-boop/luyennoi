@@ -9,6 +9,7 @@ import time
 import librosa
 import numpy as np
 import logging
+import unicodedata
 
 # Optional: portalocker for cross-process file locking
 try:
@@ -205,6 +206,40 @@ def merged_vocab_for_lesson(lesson_id: str):
             v2["audio_url"] = f"/static/samples/{fn}" if fn else None
             result.append(v2)
     return result
+
+
+def sanitize_filename(name: Optional[str]) -> str:
+    """Sanitize an incoming filename for safe upload/storage.
+
+    - Normalize Unicode (NFKD) and strip diacritics
+    - Replace whitespace with underscores
+    - Allow only a conservative subset of chars (alnum, dot, dash, underscore)
+    - Collapse repeated underscores and trim length to 255
+    Returns a safe ASCII filename; if input is falsy returns an empty string.
+    """
+    if not name:
+        return ""
+    try:
+        # basename only
+        base = os.path.basename(name)
+        # Normalize and remove diacritics
+        nk = unicodedata.normalize('NFKD', base)
+        no_diac = ''.join(c for c in nk if not unicodedata.combining(c))
+        # Replace spaces with underscore
+        replaced = re.sub(r"\s+", "_", no_diac)
+        # Keep only safe characters
+        safe = re.sub(r"[^A-Za-z0-9._\-]", "", replaced)
+        # Collapse repeated underscores/dots/dashes
+        safe = re.sub(r"_+", "_", safe)
+        safe = safe.strip('._-')
+        if not safe:
+            return ""
+        # Limit length
+        if len(safe) > 255:
+            safe = safe[:255]
+        return safe
+    except Exception:
+        return os.path.basename(name) or ""
 
 def convert_to_wav16_mono(src_path: str, dst_path: str) -> None:
     try:

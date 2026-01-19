@@ -581,6 +581,11 @@ def api_status(job_id: str):
 	Returns job info from Redis-backed store or {"status":"not_found"}.
 	"""
 	j = job_get(job_id)
+	# Log status lookups to help trace client polling
+	try:
+		helpers.logger.debug(f"Status requested: job_id={job_id} -> {j}")
+	except Exception:
+		pass
 	if not j:
 		return {"status": "not_found"}
 	return j
@@ -662,9 +667,11 @@ async def api_upload(
 			meta_obj = {"raw": metadata}
 
 	# Register task
+	# Sanitize incoming filename to avoid separator/encoding issues
+	orig_name = helpers.sanitize_filename(file.filename or f"upload_{job_id}")
 	UPLOAD_TASKS[job_id] = {
 		"status": "queued",
-		"original_filename": file.filename,
+		"original_filename": orig_name,
 		"size": total,
 		"content_type": detected,
 		"uploaded_at": time.time(),
@@ -676,8 +683,14 @@ async def api_upload(
 	# Add to unified job store so external callers can poll /status/{job_id}
 	job_set(job_id, {"status": "processing", "type": "upload", "created_at": time.time()})
 
+	# Log job creation for easier debugging
+	try:
+		helpers.logger.info(f"Upload accepted: job_id={job_id} original_filename={orig_name} size={total}")
+	except Exception:
+		pass
+
 	# Enqueue background processing
-	_enqueue_processing(job_id, tmp_path, file.filename, {"lesson_id": lesson_id, **meta_obj})
+	_enqueue_processing(job_id, tmp_path, orig_name, {"lesson_id": lesson_id, **meta_obj})
 
 	return JSONResponse(status_code=202, content={"status": "accepted", "job_id": job_id, "message": "processing"})
 
@@ -772,7 +785,8 @@ async def api_upload_simple(file: UploadFile = File(...), lesson_id: Optional[st
 		raise HTTPException(status_code=400, detail="Empty file")
 	if len(contents) > helpers.MAX_UPLOAD_BYTES:
 		raise HTTPException(status_code=413, detail="File too large")
-	_, ext = os.path.splitext(file.filename)
+	safe_name = helpers.sanitize_filename(file.filename or "")
+	_, ext = os.path.splitext(safe_name or file.filename or "")
 	ext = ext or ".wav"
 	sample_id = str(uuid.uuid4())[:8]
 	raw_fname = f"{sample_id}{ext}"
