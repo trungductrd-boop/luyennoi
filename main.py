@@ -17,6 +17,7 @@ import uvicorn
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
+import numpy as _np
 try:
     import portalocker
 except Exception:
@@ -520,12 +521,24 @@ def _save_job_result(job_id: str, payload: dict):
                     helpers.logger.debug("fsync not available or failed for %s", tmp_path)
             try:
                 os.replace(tmp_path, jf)
+                try:
+                    helpers.logger.info("Saved job result for job_id=%s path=%s", job_id, jf)
+                except Exception:
+                    pass
             except Exception:
                 os.rename(tmp_path, jf)
+                try:
+                    helpers.logger.info("Saved job result for job_id=%s path=%s", job_id, jf)
+                except Exception:
+                    pass
         except Exception:
             # If writing tmp failed, attempt best-effort direct write
             with open(jf, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
+            try:
+                helpers.logger.info("Saved job result for job_id=%s path=%s", job_id, jf)
+            except Exception:
+                pass
         # Propagate to centralized job store (Redis) if audio_api.job_set available
         try:
             try:
@@ -914,55 +927,77 @@ def get_result(job_id: str):
     return data
 
 
-# -------------------------
-# Mouth analysis endpoint (MediaPipe client will POST here)
-# -------------------------
+@app.get("/result/analysis/{job_id}")
+def get_result_analysis(job_id: str):
+    """Return detailed analysis metrics for a completed job using saved features.
 
-# Create log dir
-LOG_DIR = getattr(helpers, "LOG_DIR", "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
+    Requires the job result to include `result.features_sample` and `result.features_user`
+    (the mean-MFCC vectors plus pitch and tempo). Returns MFCC euclidean distance,
+    MFCC cosine similarity, pitch diff, tempo diff and the original result payload.
+    """
+    data = _load_job_result(job_id)
+    if data is None:
+        return {"status": "processing"}
+    if not isinstance(data, dict):
+        return {"status": "error", "error": "invalid job data"}
+    if data.get("status") != "done":
+        return {"status": data.get("status", "processing")}
+    res = data.get("result") or {}
+    f_sample = res.get("features_sample")
+    f_user = res.get("features_user")
+    if not f_sample or not f_user:
+        return {"status": "done", "message": "No feature vectors available for analysis", "result": res}
 
-class MouthPayload(BaseModel):
-    ts: str
-    features: Dict[str, Any]
-    meta: Dict[str, Any] = {}
-
-MAR_SPEAK_THRESHOLD = 0.18
-
-def analyze_features(features: Dict[str, Any]) -> Dict[str, Any]:
-    """Very small heuristic analysis based on normalized mouth opening (MAR)."""
     try:
-        mar = float(features.get("normalized_mar", 0.0))
-    except Exception:
-        mar = 0.0
-    mouth_h = float(features.get("mouth_height", 0.0) or 0.0)
-    mouth_w = float(features.get("mouth_width", 0.0) or 0.0)
-    result = {"normalized_mar": mar, "mouth_h": mouth_h, "mouth_w": mouth_w}
-    if mar > MAR_SPEAK_THRESHOLD:
-        result["likely_speaking"] = True
-        result["note"] = "Mouth open beyond threshold — likely speaking or wide open."
-    else:
-        result["likely_speaking"] = False
-        result["note"] = "Mouth small/closed."
-    return result
+        a = _np.array(f_sample.get("mfcc") if isinstance(f_sample, dict) else f_sample)
+        b = _np.array(f_user.get("mfcc") if isinstance(f_user, dict) else f_user)
+        # Ensure 1D vectors
+        a = a.flatten()
+        b = b.flatten()
+        # Pad shorter vector with zeros if lengths differ
+        if a.shape[0] != b.shape[0]:
+            mx = max(a.shape[0], b.shape[0])
+            a = _np.pad(a, (0, mx - a.shape[0]))
+            b = _np.pad(b, (0, mx - b.shape[0]))
 
-if getattr(helpers, 'FAST_MODE', False):
-    @app.post("/analyze-mouth")
-    async def analyze_mouth_disabled(payload: MouthPayload, request: Request):
-        return {"ok": False, "message": "analyze-mouth disabled in FAST_MODE"}
-else:
-    @app.post("/analyze-mouth")
-    async def analyze_mouth(payload: MouthPayload, request: Request):
-        rec = {"received_at": time.time(), "payload": payload.dict(), "client": request.client.host if request.client else None}
-        fname = os.path.join(LOG_DIR, f"mouthlog_{time.strftime('%Y%m%d')}.ndjson")
+        euclid = float(_np.linalg.norm(a - b))
+        # cosine similarity (1 means identical)
+        denom = float(_np.linalg.norm(a) * _np.linalg.norm(b))
+        cos_sim = float(_np.dot(a, b) / denom) if denom > 0 else 0.0
+    except Exception as e:
+        return {"status": "done", "error": f"failed to compute mfcc metrics: {e}", "result": res}
+
+    pitch_s = None
+    tempo_s = None
+    try:
+        pitch_s = float(res.get("pitch_diff")) if res.get("pitch_diff") is not None else None
+    except Exception:
         try:
-            with open(fname, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except Exception as e:
-            print("Failed to write mouth log:", e)
-        features = payload.features or {}
-        analysis = analyze_features(features)
-        return {"ok": True, "analysis": analysis, "received_ts": payload.ts}
+            # Some results embed pitch under details
+            pitch_s = float(res.get("details", {}).get("pitch_difference_hz"))
+        except Exception:
+            pitch_s = None
+    try:
+        tempo_s = float(res.get("tempo_diff")) if res.get("tempo_diff") is not None else None
+    except Exception:
+        try:
+            tempo_s = float(res.get("details", {}).get("tempo_difference_bpm"))
+        except Exception:
+            tempo_s = None
+
+    analysis = {
+        "mfcc_euclidean": euclid,
+        "mfcc_cosine_similarity": cos_sim,
+        "pitch_difference_hz": pitch_s,
+        "tempo_difference_bpm": tempo_s,
+        "original_result": res,
+    }
+    return {"status": "done", "analysis": analysis}
+
+
+# Mouth/face analysis endpoint removed.
+# Previously this app accepted consumer MediaPipe snapshots at `/analyze-mouth`.
+# That functionality has been intentionally removed to disable facial/mouth analysis.
 
 
 if __name__ == "__main__":

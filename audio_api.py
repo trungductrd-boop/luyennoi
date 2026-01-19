@@ -26,6 +26,9 @@ redis_client = _redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decod
 
 JOB_TTL = int(os.getenv("JOB_TTL", 300))  # seconds
 
+# In-memory fallback unified job store used when Redis is unavailable
+JOB_STORE: dict = {}
+
 def job_key(job_id: str) -> str:
 	return f"job:{job_id}"
 
@@ -33,16 +36,60 @@ def job_set(job_id: str, data: dict, ttl: int = JOB_TTL):
 	try:
 		redis_client.setex(job_key(job_id), ttl, _json.dumps(data))
 	except Exception:
-		# best-effort: ignore redis errors to avoid crashing
-		pass
+		# Redis unavailable -> record in local in-memory store as fallback
+		try:
+			JOB_STORE[job_id] = {**data, "_ts": int(time.time())}
+		except Exception:
+			# swallow to avoid raising in API paths
+			pass
 
 def job_get(job_id: str):
 	try:
 		raw = redis_client.get(job_key(job_id))
 		if not raw:
+			# Redis returned nothing; check in-memory fallback stores
+			# 1) check unified in-memory JOB_STORE
+			try:
+				if job_id in JOB_STORE:
+					return JOB_STORE[job_id]
+			except Exception:
+				pass
+			# 2) check ANALYSIS_TASKS / UPLOAD_TASKS for legacy callers
+			try:
+				if job_id in ANALYSIS_TASKS:
+					entry = ANALYSIS_TASKS.get(job_id)
+					# normalize shape
+					return {"status": entry.get("status"), "result": entry.get("result"), "type": "analysis"}
+			except Exception:
+				pass
+			try:
+				if job_id in UPLOAD_TASKS:
+					entry = UPLOAD_TASKS.get(job_id)
+					return {"status": entry.get("status"), **({"original_filename": entry.get("original_filename")} if entry.get("original_filename") else {})}
+			except Exception:
+				pass
 			return None
+		# If raw found from redis, decode
 		return _json.loads(raw)
 	except Exception:
+		# Redis error -> try in-memory fallback as above
+		try:
+			if job_id in JOB_STORE:
+				return JOB_STORE[job_id]
+		except Exception:
+			pass
+		try:
+			if job_id in ANALYSIS_TASKS:
+				entry = ANALYSIS_TASKS.get(job_id)
+				return {"status": entry.get("status"), "result": entry.get("result"), "type": "analysis"}
+		except Exception:
+			pass
+		try:
+			if job_id in UPLOAD_TASKS:
+				entry = UPLOAD_TASKS.get(job_id)
+				return {"status": entry.get("status"), **({"original_filename": entry.get("original_filename")} if entry.get("original_filename") else {})}
+		except Exception:
+			pass
 		return None
 
 router = APIRouter()
