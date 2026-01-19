@@ -24,6 +24,9 @@ try:
 except Exception:
     portalocker = None
 
+# Global lock to limit concurrent heavy jobs to 1 to reduce memory spikes
+PROCESS_LOCK = threading.Lock()
+
 # import shared helpers and router
 # Local imports so `uvicorn main:app` works on deploy
 import helpers
@@ -365,10 +368,38 @@ async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[Up
     except Exception:
         pass
 
-    # schedule background processing
-    if background_tasks is None:
-        raise HTTPException(status_code=500, detail="Server misconfiguration: BackgroundTasks unavailable")
-    background_tasks.add_task(process_compare_job, sample_path, user_temp_path, sample_uploaded_temp, sample_id, job_id)
+    # schedule background processing: prefer Redis queue if available (multi-instance safe)
+    scheduled = False
+    try:
+        import audio_api as _audio_api
+        rc = getattr(_audio_api, 'redis_client', None)
+        if rc:
+            try:
+                qpayload = json.dumps({
+                    'task': 'compare',
+                    'sample_path': sample_path,
+                    'user_temp_path': user_temp_path,
+                    'sample_uploaded_temp': bool(sample_uploaded_temp),
+                    'sample_id': sample_id,
+                    'job_id': job_id,
+                })
+                # push to queue (use RPUSH so workers BRPOP)
+                rc.rpush('job_queue', qpayload)
+                try:
+                    helpers.logger.info('Enqueued compare job %s to redis queue', job_id)
+                except Exception:
+                    pass
+                scheduled = True
+            except Exception:
+                scheduled = False
+    except Exception:
+        scheduled = False
+
+    if not scheduled:
+        # fallback to in-process BackgroundTasks
+        if background_tasks is None:
+            raise HTTPException(status_code=500, detail="Server misconfiguration: BackgroundTasks unavailable")
+        background_tasks.add_task(process_compare_job, sample_path, user_temp_path, sample_uploaded_temp, sample_id, job_id)
 
     return {"status": "processing", "job_id": job_id}
 
@@ -898,7 +929,7 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
 
             matches = []
             if candidates:
-                max_workers = min(8, len(candidates))
+                max_workers = min(4, len(candidates))
                 with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
                     futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, f2) for (s_id, meta, ref_path) in candidates]
                     for fut in as_completed(futures):

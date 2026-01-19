@@ -20,3 +20,4 @@ soundfile
 requests
 python-multipart
 pydantic
+psutil

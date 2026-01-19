@@ -10,6 +10,22 @@ import librosa
 import numpy as np
 import logging
 import unicodedata
+ 
+# Optional memory logging helper
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+def log_mem(tag: str):
+    try:
+        if psutil:
+            mem = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
+            logger.info(f"[mem] {tag} RAM={mem:.1f}MB")
+        else:
+            logger.debug(f"[mem] {tag} psutil not available")
+    except Exception:
+        pass
 
 # Optional: portalocker for cross-process file locking
 try:

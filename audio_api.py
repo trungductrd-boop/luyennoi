@@ -18,11 +18,24 @@ from pydantic import BaseModel, field_validator
 import json as _json
 import redis as _redis # pyright: ignore[reportMissingImports]
 
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-REDIS_DB = int(os.getenv("REDIS_DB", 0))
+# Prefer a full Redis URL if provided (handles TLS/managed providers)
+REDIS_URL = os.getenv("REDIS_URL") or os.getenv("REDIS_TLS_URL")
+redis_client = None
+if REDIS_URL:
+	try:
+		# from_url handles redis:// and rediss:// schemes
+		redis_client = _redis.from_url(REDIS_URL, decode_responses=True)
+	except Exception:
+		redis_client = None
 
-redis_client = _redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+if redis_client is None:
+	REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+	REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+	REDIS_DB = int(os.getenv("REDIS_DB", 0))
+	try:
+		redis_client = _redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True)
+	except Exception:
+		redis_client = None
 
 JOB_TTL = int(os.getenv("JOB_TTL", 300))  # seconds
 
@@ -128,12 +141,23 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 import threading
 
 # Background executor for light async processing
-_default_workers = max(4, (os.cpu_count() or 4))
-if getattr(helpers, 'FAST_MODE', False):
-	# In FAST_MODE keep a very small pool to reduce scheduling/overhead
-	executor = ThreadPoolExecutor(max_workers=2)
+_default_workers = max(2, min(4, (os.cpu_count() or 2)))
+# Allow overriding via env; default smaller pools to limit memory usage.
+try:
+	ENV_MAX_WORKERS = int(os.getenv('MAX_WORKER_THREADS', '0') or 0)
+except Exception:
+	ENV_MAX_WORKERS = 0
+if ENV_MAX_WORKERS > 0:
+	max_threads = ENV_MAX_WORKERS
 else:
-	executor = ThreadPoolExecutor(max_workers=max(8, _default_workers))
+	if getattr(helpers, 'FAST_MODE', False):
+		# In FAST_MODE keep a very small pool to reduce scheduling/overhead
+		max_threads = 2
+	else:
+		# conservative default for production to avoid spikes
+		max_threads = min(4, _default_workers)
+
+executor = ThreadPoolExecutor(max_workers=max_threads)
 
 # In-memory cache for extracted sample features to avoid repeated costly extraction
 SAMPLE_FEATURES: dict = {}
@@ -276,7 +300,8 @@ def _warm_sample_cache_blocking(paths: list[str]):
 	"""Extract features for given paths in parallel using a process pool (blocking)."""
 	results = {}
 	try:
-		with ProcessPoolExecutor(max_workers=max(2, (os.cpu_count() or 2))) as pexec:
+		# cap process pool workers to reduce memory usage
+		with ProcessPoolExecutor(max_workers=min(2, (os.cpu_count() or 1))) as pexec:
 			futures = {pexec.submit(helpers.extract_features, p): p for p in paths}
 			for fut in as_completed(futures):
 				p = futures[fut]
@@ -587,7 +612,7 @@ def _enqueue_analysis(task_id: str, user_wav_path: str, created_tmp: bool, *, mo
 
 				matches = []
 				if candidates:
-					max_workers = min(8, len(candidates))
+					max_workers = min(4, len(candidates))
 					with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
 						futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, user_features) for (s_id, meta, ref_path) in candidates]
 						for fut in as_completed(futures):
@@ -1524,7 +1549,7 @@ async def api_analyze(
 
 		matches = []
 		if candidates:
-			max_workers = min(8, len(candidates))
+			max_workers = min(4, len(candidates))
 			with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
 				futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, user_features) for (s_id, meta, ref_path) in candidates]
 				for fut in as_completed(futures):
@@ -1939,7 +1964,7 @@ async def api_analyze_auto(
 		candidates.append((sample_id, meta, ref_path))
 
 	if candidates:
-		max_workers = min(8, len(candidates))
+		max_workers = min(4, len(candidates))
 		with ThreadPoolExecutor(max_workers=max_workers) as comp_exec:
 			futures = [comp_exec.submit(_build_match_entry, s_id, meta, ref_path, user_features) for (s_id, meta, ref_path) in candidates]
 			for fut in as_completed(futures):
