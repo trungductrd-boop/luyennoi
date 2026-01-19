@@ -19,7 +19,8 @@ def upload_file(path: str, url: str, api_key: str):
     headers = {}
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    r = requests.post(f"{url.rstrip('/')}/api/upload", files=files, headers=headers)
+    # `url` is expected to be the full upload endpoint (e.g. http://host:port/compare or http://host:port/api/upload)
+    r = requests.post(url, files=files, headers=headers)
     try:
         data = r.json()
     except Exception:
@@ -63,6 +64,9 @@ def main():
     parser.add_argument("--attempts", type=int, default=30)
     parser.add_argument("--interval", type=float, default=1.0)
     parser.add_argument("--use-local-on-fail", action="store_true", help="Offer to run local conversion/analysis on failure")
+    parser.add_argument("--flask-demo", action="store_true", help="Target Flask demo server endpoints (/compare and /status/<job_id>)")
+    parser.add_argument("--upload-endpoint", default=None, help="Override upload endpoint path (e.g. /compare or /api/upload)")
+    parser.add_argument("--status-endpoint", default=None, help="Override status endpoint template (use {job_id}) (e.g. /status/{job_id} or /api/status/{job_id})")
     args = parser.parse_args()
 
     path = args.file
@@ -71,7 +75,19 @@ def main():
         sys.exit(2)
 
     print("Uploading", path)
-    status, data = upload_file(path, args.url, args.api_key)
+    # determine endpoints
+    if args.upload_endpoint:
+        upload_path = args.upload_endpoint
+    else:
+        upload_path = "/compare" if args.flask_demo else "/api/upload"
+
+    if args.status_endpoint:
+        status_template = args.status_endpoint
+    else:
+        status_template = "/status/{job_id}" if args.flask_demo else "/api/status/{job_id}"
+
+    # upload
+    status, data = upload_file(path, args.url.rstrip('/') + upload_path, args.api_key)
     print("Upload response:", status, data)
     if not data or "job_id" not in data:
         print("Upload did not return job_id. Response:", data)
@@ -80,7 +96,35 @@ def main():
     print("Job ID:", job_id)
 
     print("Start polling status... (attempts=", args.attempts, ")")
-    res = poll_status(job_id, args.url, args.api_key, max_attempts=args.attempts, initial_interval=args.interval)
+    # poll using the chosen status endpoint template
+    def poll_using_template(jid):
+        url_base = args.url.rstrip('/')
+        status_url = url_base + status_template.format(job_id=jid)
+        attempt = 0
+        interval = args.interval
+        headers = {}
+        if args.api_key:
+            headers["Authorization"] = f"Bearer {args.api_key}"
+        while attempt < args.attempts:
+            attempt += 1
+            try:
+                r = requests.get(status_url, headers=headers, timeout=10)
+                data = r.json()
+            except Exception as e:
+                print(f"Poll attempt {attempt} failed: {e}")
+                data = None
+            print(f"Poll {attempt}: {data}")
+            if data and isinstance(data, dict):
+                status = data.get("status")
+                if status and status != "processing" and status != "queued":
+                    return data
+                if status == "done" or data.get("result"):
+                    return data
+            time.sleep(interval)
+            interval = min(interval * 2, 10.0)
+        return None
+
+    res = poll_using_template(job_id)
     if res:
         print("Final status:", res)
         return
