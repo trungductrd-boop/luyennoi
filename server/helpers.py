@@ -42,8 +42,23 @@ def job_file_path(job_id: str) -> str:
 def save_job_result(job_id: str, payload: dict):
     try:
         jf = job_file_path(job_id)
-        with open(jf, "w", encoding="utf-8") as f:
+        # Write atomically: write to temp file in same dir, fsync, then replace
+        dirn = os.path.dirname(jf) or '.'
+        tmp_path = os.path.join(dirn, f".{job_id}.tmp")
+        with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                # fsync may not be available on some platforms; ignore but log
+                logger.debug("fsync not available or failed for %s", tmp_path)
+        # Atomic replace
+        try:
+            os.replace(tmp_path, jf)
+        except Exception:
+            # fallback to rename
+            os.rename(tmp_path, jf)
         logger.info(f"Saved job result: {job_id}")
     except Exception as e:
         logger.exception("Failed to save job result: %s", e)
@@ -54,8 +69,25 @@ def load_job_result(job_id: str):
         jf = job_file_path(job_id)
         if not os.path.exists(jf):
             return None
-        with open(jf, "r", encoding="utf-8") as f:
-            return json.load(f)
+        # Attempt to load JSON; if file was mid-write we may get JSONDecodeError.
+        # Retry a few times with short sleep before treating as still processing.
+        attempts = 3
+        for i in range(attempts):
+            try:
+                with open(jf, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                logger.warning("Partial/invalid job file read for %s, attempt %d/%d", job_id, i+1, attempts)
+                time_sleep = 0.05
+                try:
+                    import time
+                    time.sleep(time_sleep)
+                except Exception:
+                    pass
+                continue
+        # If still invalid after retries, assume worker is still processing and return processing status
+        logger.warning("Job file %s appears incomplete; treating as processing", jf)
+        return {"status": "processing"}
     except Exception as e:
         logger.exception("Failed to load job result: %s", e)
         return None
