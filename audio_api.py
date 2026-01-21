@@ -1036,7 +1036,7 @@ async def api_analyze(
 			pass
 
 		if not matches:
-			raise HTTPException(status_code=404, detail="No matching samples found")
+			return _default_auto_response("No matching samples found")
 
 		matches.sort(key=lambda x: x["overall_score"], reverse=True)
 		best_match = matches[0]
@@ -1220,7 +1220,7 @@ async def api_analyze_auto(
 			os.remove(user_wav_path)
 		except Exception:
 			pass
-		raise HTTPException(status_code=404, detail="No reference samples found. Please upload sample audios first.")
+		return _default_auto_response("No reference samples found. Please upload sample audios first.")
 	
 	# Compare with all samples
 	matches = []
@@ -1282,7 +1282,7 @@ async def api_analyze_auto(
 		pass
 	
 	if not matches:
-		raise HTTPException(status_code=404, detail="No matching samples found")
+		return _default_auto_response("No matching samples found")
 	
 	# Sort by overall_score descending
 	matches.sort(key=lambda x: x["overall_score"], reverse=True)
@@ -1401,7 +1401,7 @@ async def api_analyze_vocab(
 					os.remove(user_wav_path)
 			except Exception:
 				pass
-			raise HTTPException(status_code=404, detail=f"No samples found for vocab_id={vocab_id}")
+			return _default_compare_response(f"No samples found for vocab_id={vocab_id}")
 
 		# Extract user features
 		try:
