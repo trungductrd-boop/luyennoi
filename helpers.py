@@ -258,27 +258,56 @@ def sanitize_filename(name: Optional[str]) -> str:
         return os.path.basename(name) or ""
 
 def convert_to_wav16_mono(src_path: str, dst_path: str) -> None:
+    tmp = dst_path + ".tmp"
     try:
-        cmd = [FFMPEG_BIN, "-y", "-i", src_path, "-ac", "1", "-ar", "16000", "-vn", dst_path]
-        result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        logger.info(f"Converted {src_path} to {dst_path}")
-    except subprocess.CalledProcessError as e:
-        stderr_text = e.stderr.decode() if e and getattr(e, 'stderr', None) else str(e)
-        logger.error(f"FFmpeg conversion failed: {stderr_text}")
-        # write stderr to a temp log for easier debugging from API
+        os.makedirs(os.path.dirname(dst_path) or '.', exist_ok=True)
+        cmd = [FFMPEG_BIN, "-y", "-i", src_path, "-ac", "1", "-ar", "16000", "-vn", tmp]
+        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if proc.returncode != 0:
+            stderr_text = proc.stderr or proc.stdout or f"returncode={proc.returncode}"
+            logger.error("FFmpeg conversion_failed: %s", stderr_text)
+            try:
+                os.makedirs(TMP_DIR, exist_ok=True)
+                stamp = int(time.time() * 1000)
+                err_path = os.path.join(TMP_DIR, f"ffmpeg_convert_error_{stamp}.log")
+                with open(err_path, "w", encoding="utf-8") as ef:
+                    ef.write(stderr_text)
+                logger.info("Wrote ffmpeg stderr to %s", err_path)
+            except Exception:
+                pass
+            # remove partial tmp file if present
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+            raise subprocess.CalledProcessError(proc.returncode, cmd, output=proc.stdout, stderr=proc.stderr)
+
+        # verify tmp exists and is non-empty
+        if not os.path.exists(tmp):
+            raise RuntimeError(f"ffmpeg reported success but output missing: {tmp}")
         try:
-            os.makedirs(TMP_DIR, exist_ok=True)
-            stamp = int(time.time() * 1000)
-            err_path = os.path.join(TMP_DIR, f"ffmpeg_convert_error_{stamp}.log")
-            with open(err_path, "w", encoding="utf-8") as ef:
-                ef.write(stderr_text)
-            logger.info(f"Wrote ffmpeg stderr to {err_path}")
+            st = os.stat(tmp)
+            if st.st_size == 0:
+                raise RuntimeError(f"ffmpeg produced empty output: {tmp}")
         except Exception:
-            pass
-        raise RuntimeError(f"Audio conversion failed: {stderr_text}")
+            # propagate as runtime error
+            raise
+
+        # atomic replace to avoid half-written outputs being observed by other threads
+        try:
+            os.replace(tmp, dst_path)
+        except Exception:
+            # fallback to rename
+            os.rename(tmp, dst_path)
+        try:
+            st2 = os.stat(dst_path)
+            logger.info("Converted %s to %s (size=%d)", src_path, dst_path, st2.st_size)
+        except Exception:
+            logger.info("Converted %s to %s", src_path, dst_path)
     except FileNotFoundError:
         logger.error("FFmpeg not found. Please install ffmpeg and add to PATH")
-        raise RuntimeError("FFmpeg not installed")
+        raise
 
 def extract_features(path: str):
     try:

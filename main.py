@@ -517,9 +517,9 @@ def _compare_audio_paths(sample_path: str, user_temp_path: str, sample_uploaded_
     sample_conv = sample_path + ".conv.wav"
     user_conv = user_temp_path + ".conv.wav"
     try:
-        helpers.convert_to_wav16_mono(sample_path, sample_conv)
-        helpers.convert_to_wav16_mono(user_temp_path, user_conv)
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        _safe_convert(sample_path, sample_conv)
+        _safe_convert(user_temp_path, user_conv)
+    except Exception as e:
         try:
             os.remove(user_temp_path)
         except Exception:
@@ -535,13 +535,27 @@ def _compare_audio_paths(sample_path: str, user_temp_path: str, sample_uploaded_
                     os.remove(p)
             except Exception:
                 pass
-        detail = "ffmpeg not found on server" if isinstance(e, FileNotFoundError) else "Error converting audio (ffmpeg required)"
+        # Distinguish missing ffmpeg vs conversion error when possible
+        if isinstance(e, FileNotFoundError):
+            detail = "ffmpeg not found on server"
+        else:
+            detail = f"conversion_failed: {e}"
         raise HTTPException(status_code=500, detail=detail)
 
     try:
         f1 = helpers.extract_features(sample_conv)
         f2 = helpers.extract_features(user_conv)
-    except Exception:
+    except Exception as e:
+        try:
+            helpers.logger.error("Feature extraction failed for %s and/or %s: %s", sample_conv, user_conv, e, exc_info=True)
+        except Exception:
+            pass
+        # dump listing of directory for debugging
+        try:
+            d = os.path.dirname(user_conv) or '.'
+            helpers.logger.error("Dir listing for %s: %s", d, os.listdir(d))
+        except Exception:
+            pass
         for p in (user_temp_path, user_conv, sample_conv):
             try:
                 if os.path.exists(p):
@@ -554,7 +568,7 @@ def _compare_audio_paths(sample_path: str, user_temp_path: str, sample_uploaded_
                     os.remove(sample_path)
             except Exception:
                 pass
-        raise HTTPException(status_code=400, detail="Failed to analyze audio. Ensure files are valid speech recordings.")
+        raise HTTPException(status_code=400, detail=f"feature_extraction_failed: {e}")
 
     mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(f1, f2)
 
@@ -718,6 +732,36 @@ def _load_job_result(job_id: str) -> Optional[dict]:
         return None
 
 
+def _safe_convert(src: str, dst: str, attempts: int = 3, delay: float = 0.5) -> None:
+    """Attempt conversion with retries and verify output exists.
+
+    Uses helpers.convert_to_wav16_mono and verifies that the dst file exists
+    before returning. Raises the last exception on failure.
+    """
+    last_exc = None
+    for i in range(attempts):
+        try:
+            helpers.logger.info("Converting %s -> %s (attempt %d/%d)", src, dst, i + 1, attempts)
+            helpers.convert_to_wav16_mono(src, dst)
+            if os.path.exists(dst):
+                try:
+                    st = os.stat(dst)
+                    helpers.logger.info("Conversion succeeded, output size=%d bytes", st.st_size)
+                except Exception:
+                    helpers.logger.info("Conversion succeeded (size unknown)")
+                return
+            else:
+                helpers.logger.warning("convert returned but output missing: %s", dst)
+        except Exception as e:
+            last_exc = e
+            helpers.logger.warning("convert attempt %d failed: %s", i + 1, e)
+        try:
+            time.sleep(delay)
+        except Exception:
+            pass
+    raise RuntimeError(f"convert_to_wav16_mono failed for {src} -> {dst}: last_exc={last_exc}")
+
+
 def _job_scanner_loop():
     """Background loop that scans local job files and heals stale 'processing' jobs.
 
@@ -827,8 +871,17 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
         # Otherwise, perform auto-match flow (no sample provided)
         user_conv = user_temp_path + ".conv.wav"
         try:
-            helpers.convert_to_wav16_mono(user_temp_path, user_conv)
+            _safe_convert(user_temp_path, user_conv)
         except Exception as e:
+            try:
+                helpers.logger.error("Conversion failed for %s -> %s: %s", user_temp_path, user_conv, e, exc_info=True)
+            except Exception:
+                pass
+            try:
+                # list dir to aid debugging
+                helpers.logger.error("Dir listing for %s: %s", os.path.dirname(user_conv) or '.', os.listdir(os.path.dirname(user_conv) or '.'))
+            except Exception:
+                pass
             try:
                 os.remove(user_temp_path)
             except Exception:
