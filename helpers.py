@@ -258,7 +258,8 @@ def sanitize_filename(name: Optional[str]) -> str:
         return os.path.basename(name) or ""
 
 def convert_to_wav16_mono(src_path: str, dst_path: str) -> None:
-    tmp = dst_path + ".tmp"
+    # Use a temp filename that ends with .wav so ffmpeg can infer WAV muxer
+    tmp = dst_path + ".tmp.wav"
     try:
         os.makedirs(os.path.dirname(dst_path) or '.', exist_ok=True)
         cmd = [FFMPEG_BIN, "-y", "-i", src_path, "-ac", "1", "-ar", "16000", "-vn", tmp]
