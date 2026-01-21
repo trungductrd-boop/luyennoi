@@ -749,7 +749,9 @@ async def api_analyze_compare(
 
 		# Extract features and compare
 		try:
-			user_features = helpers.extract_features(user_wav_path)
+			helpers.logger.info("Starting feature extraction for user audio: %s", user_wav_path)
+			user_features = _extract_features_with_timeout(user_wav_path, timeout=30)
+			helpers.logger.info("Finished feature extraction for user audio: %s", user_wav_path)
 		except Exception as e:
 			helpers.logger.error(f"Feature extraction failed: {e}")
 			try:
@@ -760,7 +762,9 @@ async def api_analyze_compare(
 			return _default_compare_response("Feature extraction failed")
 
 		try:
-			ref_features = helpers.extract_features(ref_path)
+			helpers.logger.info("Starting feature extraction for reference: %s", ref_path)
+			ref_features = _extract_features_with_timeout(ref_path, timeout=30)
+			helpers.logger.info("Finished feature extraction for reference: %s", ref_path)
 		except Exception as e:
 			helpers.logger.error(f"Feature extraction (ref) failed: {e}")
 			try:
@@ -915,8 +919,13 @@ async def api_analyze(
 				return _default_compare_response(f"Reference audio file not found: {ref_filename}")
 
 			try:
-				user_features = helpers.extract_features(user_wav_path)
-				ref_features = helpers.extract_features(ref_path)
+				helpers.logger.info("Starting feature extraction for user audio: %s", user_wav_path)
+				user_features = _extract_features_with_timeout(user_wav_path, timeout=30)
+				helpers.logger.info("Finished feature extraction for user audio: %s", user_wav_path)
+
+				helpers.logger.info("Starting feature extraction for reference: %s", ref_path)
+				ref_features = _extract_features_with_timeout(ref_path, timeout=30)
+				helpers.logger.info("Finished feature extraction for reference: %s", ref_path)
 			except Exception as e:
 				helpers.logger.error(f"Feature extraction failed: {e}")
 				return _default_compare_response("Feature extraction failed")
@@ -975,7 +984,9 @@ async def api_analyze(
 
 		# Otherwise, auto-detect best matching sample across all samples
 		try:
-			user_features = helpers.extract_features(user_wav_path)
+			helpers.logger.info("Starting feature extraction for user audio: %s", user_wav_path)
+			user_features = _extract_features_with_timeout(user_wav_path, timeout=30)
+			helpers.logger.info("Finished feature extraction for user audio: %s", user_wav_path)
 		except Exception as e:
 			helpers.logger.error(f"Feature extraction failed: {e}")
 			return _default_auto_response("Feature extraction failed")
@@ -997,7 +1008,9 @@ async def api_analyze(
 			if not os.path.exists(ref_path):
 				continue
 			try:
-				ref_features = helpers.extract_features(ref_path)
+				helpers.logger.info("Starting feature extraction for candidate reference: %s", ref_path)
+				ref_features = _extract_features_with_timeout(ref_path, timeout=30)
+				helpers.logger.info("Finished feature extraction for candidate reference: %s", ref_path)
 				mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
 				mfcc_score = max(0, 100 - mfcc_dist * 2)
 				pitch_score = max(0, 100 - pitch_diff * 0.5)
@@ -1059,7 +1072,9 @@ async def api_analyze(
 				if isinstance(ms, list) and ms:
 					ref_path = os.path.join(helpers.SAMPLES_DIR, best_match.get("filename"))
 					if os.path.exists(ref_path):
-						ref_features = helpers.extract_features(ref_path)
+						helpers.logger.info("Starting feature extraction for multimodal reference (auto): %s", ref_path)
+						ref_features = _extract_features_with_timeout(ref_path, timeout=30)
+						helpers.logger.info("Finished feature extraction for multimodal reference (auto): %s", ref_path)
 						mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
 						audio_artic = helpers.helpers_multimodal.compute_audio_articulatory_features(user_wav_path)
 						mouth_analysis = helpers.helpers_multimodal.analyze_mouth_series_extended(ms)
@@ -1306,7 +1321,9 @@ async def api_analyze_auto(
 			if isinstance(ms, list) and ms:
 				ref_path = os.path.join(helpers.SAMPLES_DIR, best_match.get("filename"))
 				if os.path.exists(ref_path):
-					ref_features = helpers.extract_features(ref_path)
+					helpers.logger.info("Starting feature extraction for multimodal reference: %s", ref_path)
+					ref_features = _extract_features_with_timeout(ref_path, timeout=30)
+					helpers.logger.info("Finished feature extraction for multimodal reference: %s", ref_path)
 					mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
 					audio_artic = helpers.helpers_multimodal.compute_audio_articulatory_features(user_wav_path)
 					mouth_analysis = helpers.helpers_multimodal.analyze_mouth_series_extended(ms)
@@ -1405,7 +1422,9 @@ async def api_analyze_vocab(
 
 		# Extract user features
 		try:
-			user_features = helpers.extract_features(user_wav_path)
+			helpers.logger.info("Starting feature extraction for user audio (vocab): %s", user_wav_path)
+			user_features = _extract_features_with_timeout(user_wav_path, timeout=30)
+			helpers.logger.info("Finished feature extraction for user audio (vocab): %s", user_wav_path)
 		except Exception as e:
 			helpers.logger.error(f"Feature extraction failed: {e}")
 			try:
@@ -1415,11 +1434,23 @@ async def api_analyze_vocab(
 				pass
 			return _default_compare_response("Feature extraction failed")
 
+			# Validate extracted features
+			if not user_features:
+				helpers.logger.error("Extracted user features empty (vocab)")
+				try:
+					if created_tmp and user_wav_path and os.path.exists(user_wav_path):
+						os.remove(user_wav_path)
+				except Exception:
+					pass
+				return _default_compare_response("Feature extraction produced no usable features")
+
 		# Compare against filtered set
 		matches = []
 		for s_id, meta, ref_path in filtered:
 			try:
-				ref_features = helpers.extract_features(ref_path)
+				helpers.logger.info("Starting feature extraction for vocab candidate: %s", ref_path)
+				ref_features = _extract_features_with_timeout(ref_path, timeout=30)
+				helpers.logger.info("Finished feature extraction for vocab candidate: %s", ref_path)
 				mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
 				mfcc_score = max(0, 100 - mfcc_dist * 2)
 				pitch_score = max(0, 100 - pitch_diff * 0.5)
