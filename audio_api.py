@@ -21,16 +21,144 @@ CHUNK_SIZE = 1024 * 1024  # 1MB
 # Additional imports for upload handling
 import json
 import time
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Background executor for light async processing (placeholder for real queue)
-executor = ThreadPoolExecutor(max_workers=2)
+_default_workers = max(2, (os.cpu_count() or 2))
+if getattr(helpers, 'FAST_MODE', False):
+	executor = ThreadPoolExecutor(max_workers=2)
+else:
+	executor = ThreadPoolExecutor(max_workers=max(4, _default_workers))
 
 # In-memory task store (task_id -> meta)
 UPLOAD_TASKS: dict = {}
 
 # Default upload limit (can be overridden per endpoint)
 DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB
+
+
+# In-memory cache for extracted sample features to avoid repeated costly extraction
+SAMPLE_FEATURES: dict = {}
+SAMPLE_FEATURES_LOCK = threading.Lock()
+
+
+def _extract_features_with_timeout(path: str, timeout: int = 30) -> Optional[dict]:
+	"""Extract features using helpers.extract_features with a timeout.
+	Returns the features dict or raises the underlying exception.
+	"""
+	if not path or not os.path.exists(path):
+		raise FileNotFoundError(path)
+	fut = executor.submit(helpers.extract_features, path)
+	return fut.result(timeout=timeout)
+
+
+def _get_cached_features(path: str) -> Optional[dict]:
+	"""Return cached features for an absolute path, or None if missing."""
+	if not path:
+		return None
+	key = os.path.abspath(path)
+	with SAMPLE_FEATURES_LOCK:
+		v = SAMPLE_FEATURES.get(key)
+		# Return a deep copy to avoid accidental mutation
+		return json.loads(json.dumps(v)) if v is not None else None
+
+
+def _build_match_entry(sample_id: str, meta: dict, ref_path: str, user_features: dict) -> Optional[dict]:
+	"""Build a match entry for a candidate sample.
+	Returns a dict with sample_id, filename, overall_score, and details.
+	"""
+	try:
+		# Prefer cached features
+		feats = _get_cached_features(ref_path)
+		if feats is None:
+			feats = _extract_features_with_timeout(ref_path, timeout=30)
+			# store into cache
+			try:
+				with SAMPLE_FEATURES_LOCK:
+					SAMPLE_FEATURES[os.path.abspath(ref_path)] = feats
+			except Exception:
+				pass
+
+		mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(feats, user_features)
+
+		mfcc_score = max(0, 100 - mfcc_dist * 2)
+		pitch_score = max(0, 100 - pitch_diff * 0.5)
+		tempo_score = max(0, 100 - tempo_diff * 0.5)
+		overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
+
+		return {
+			"sample_id": sample_id,
+			"filename": os.path.basename(ref_path),
+			"overall_score": float(overall_score),
+			"details": {
+				"mfcc_distance": float(mfcc_dist),
+				"pitch_difference_hz": float(pitch_diff),
+				"tempo_difference_bpm": float(tempo_diff),
+			},
+		}
+	except Exception:
+		return None
+
+
+def warm_sample_cache_background(limit: Optional[int] = None, max_workers: int = 4):
+	"""Warm the `SAMPLE_FEATURES` cache in background.
+
+	- `limit`: optional maximum number of samples to warm (None = all).
+	- `max_workers`: parallelism for warming tasks.
+
+	This function schedules extraction tasks on the module executor and
+	returns immediately. It is safe to call multiple times; only one
+	warming run will be active at a time.
+	"""
+	# Prevent concurrent warmers
+	if getattr(warm_sample_cache_background, "_running", False):
+		return
+	def _worker():
+		try:
+			warm_sample_cache_background._running = True
+			helpers.load_persisted_store()
+			samples = helpers.PERSISTED_STORE.get("samples", {})
+			paths = []
+			for sid, meta in samples.items():
+				fn = meta.get("filename")
+				if not fn:
+					continue
+				p = os.path.join(helpers.SAMPLES_DIR, fn)
+				if os.path.exists(p):
+					paths.append((sid, p))
+			if limit:
+				paths = paths[:limit]
+
+			# Use a local pool to limit warming concurrency
+			workers = min(max_workers, max(1, len(paths)))
+			futures = []
+			with ThreadPoolExecutor(max_workers=workers) as wexec:
+				for sid, p in paths:
+					# Skip already cached
+					if _get_cached_features(p) is not None:
+						continue
+					futures.append(wexec.submit(_extract_and_store, sid, p))
+				for fut in as_completed(futures):
+					try:
+						fut.result()
+					except Exception:
+						continue
+		finally:
+			warm_sample_cache_background._running = False
+
+	def _extract_and_store(sid: str, path: str):
+		try:
+			feats = _extract_features_with_timeout(path, timeout=30)
+			with SAMPLE_FEATURES_LOCK:
+				SAMPLE_FEATURES[os.path.abspath(path)] = feats
+		except Exception:
+			pass
+
+	# Launch background thread
+	t = threading.Thread(target=_worker, daemon=True)
+	t.start()
+	return t
 
 
 def _detect_audio_type_from_file(path: Path) -> Optional[str]:
