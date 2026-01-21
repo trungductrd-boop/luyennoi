@@ -9,16 +9,53 @@ import time
 import librosa
 import numpy as np
 import logging
+import unicodedata
+ 
+# Optional memory logging helper
+try:
+    import psutil  # type: ignore
+except Exception:
+    psutil = None
+
+def log_mem(tag: str):
+    try:
+        if psutil:
+            mem = psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2
+            logger.info(f"[mem] {tag} RAM={mem:.1f}MB")
+        else:
+            logger.debug(f"[mem] {tag} psutil not available")
+    except Exception:
+        pass
+
+# Optional: portalocker for cross-process file locking
+try:
+    import portalocker
+except Exception:
+    portalocker = None
+
+# Try to import optional audio_features helper module (may not exist in minimal installs)
+try:
+    from . import audio_features
+except Exception:
+    try:
+        import audio_features
+    except Exception:
+        audio_features = None
 
 # --- Configuration ---
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024  # 5 MB
 SAMPLES_DIR = "data/samples"
 USERS_DIR = "data/users"
 STATIC_DIR = "data"
-VOCAB_STORE_FILE = "data/vocab_store.json"
+# Allow overriding persisted store path via env var to keep it outside watched dirs
+PERSIST_PATH = os.environ.get("PERSIST_PATH", "data/vocab_store.json")
+VOCAB_STORE_FILE = PERSIST_PATH
 TMP_DIR = "data/tmp"
 FFMPEG_BIN = "ffmpeg"
 ALLOWED_EXTS = {".wav", ".mp3", ".m4a", ".ogg"}
+
+# Fast mode: enable aggressive speedups and disable non-essential features.
+FAST_MODE = os.environ.get("FAST_MODE", "0") in ("1", "true", "True")
 
 # ensure directories exist
 os.makedirs(SAMPLES_DIR, exist_ok=True)
@@ -26,6 +63,9 @@ os.makedirs(USERS_DIR, exist_ok=True)
 os.makedirs(STATIC_DIR, exist_ok=True)
 os.makedirs(TMP_DIR, exist_ok=True)
 os.makedirs(os.path.dirname(VOCAB_STORE_FILE) or ".", exist_ok=True)
+
+# Lock path used for coordinating readers/writers and leader election
+LOCK_PATH = VOCAB_STORE_FILE + ".lock"
 
 # create empty store if missing
 if not os.path.exists(VOCAB_STORE_FILE):
@@ -73,19 +113,40 @@ VOCAB = {
 # persisted store (file-backed)
 PERSISTED_STORE = {"lessons": {}, "samples": {}}
 
-# Setup logging with better format
+# Internal flag: track whether the persisted store has been loaded at least once
+_PERSISTED_STORE_LOADED = False
+
+# Setup logging with better format. Lower verbosity in FAST_MODE to reduce overhead.
 logging.basicConfig(
-    level=logging.INFO,
+    level=(logging.WARNING if FAST_MODE else logging.INFO),
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 def load_persisted_store():
     global PERSISTED_STORE
+    global _PERSISTED_STORE_LOADED
     try:
-        with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
-            PERSISTED_STORE = json.load(f)
-        logger.info(f"Loaded persisted store: {len(PERSISTED_STORE.get('samples', {}))} samples")
+        # If portalocker is available, acquire a shared lock while reading to avoid races
+        if portalocker:
+            # ensure lock file exists
+            open(LOCK_PATH, "a").close()
+            with open(LOCK_PATH, "r+") as lockf:
+                portalocker.lock(lockf, portalocker.LockFlags.SHARED)
+                try:
+                    with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
+                        PERSISTED_STORE = json.load(f)
+                finally:
+                    try:
+                        portalocker.unlock(lockf)
+                    except Exception:
+                        pass
+        else:
+            with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
+                PERSISTED_STORE = json.load(f)
+        # Avoid noisy INFO logs from multiple worker processes; use DEBUG for loads
+        logger.debug(f"Loaded persisted store: {len(PERSISTED_STORE.get('samples', {}))} samples (pid={os.getpid()})")
+        _PERSISTED_STORE_LOADED = True
         
         # Load progress back into LESSONS
         progress_data = PERSISTED_STORE.get("progress", {})
@@ -110,9 +171,37 @@ def load_persisted_store():
 
 def save_persisted_store():
     try:
-        with open(VOCAB_STORE_FILE, "w", encoding="utf-8") as f:
-            json.dump(PERSISTED_STORE, f, ensure_ascii=False, indent=2)
-        logger.info("Persisted store saved successfully")
+        # Ensure destination dir exists
+        os.makedirs(os.path.dirname(VOCAB_STORE_FILE) or ".", exist_ok=True)
+        # If portalocker available, acquire exclusive lock while writing
+        # Write atomically to avoid watchers seeing partial files and to reduce reload triggers.
+        tmp_path = VOCAB_STORE_FILE + ".tmp"
+        # Ensure destination dir exists
+        os.makedirs(os.path.dirname(VOCAB_STORE_FILE) or ".", exist_ok=True)
+        if portalocker:
+            # ensure lock file exists
+            open(LOCK_PATH, "a").close()
+            with open(LOCK_PATH, "r+") as lockf:
+                portalocker.lock(lockf, portalocker.LockFlags.EXCLUSIVE)
+                try:
+                    with open(tmp_path, "w", encoding="utf-8") as f:
+                        json.dump(PERSISTED_STORE, f, ensure_ascii=False, indent=2)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    # atomic replace
+                    os.replace(tmp_path, VOCAB_STORE_FILE)
+                finally:
+                    try:
+                        portalocker.unlock(lockf)
+                    except Exception:
+                        pass
+        else:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(PERSISTED_STORE, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, VOCAB_STORE_FILE)
+        logger.info("Persisted store saved successfully (path=%s)", VOCAB_STORE_FILE)
     except Exception as e:
         logger.error(f"Error saving store: {e}")
         raise
@@ -134,14 +223,59 @@ def merged_vocab_for_lesson(lesson_id: str):
             result.append(v2)
     return result
 
+
+def sanitize_filename(name: Optional[str]) -> str:
+    """Sanitize an incoming filename for safe upload/storage.
+
+    - Normalize Unicode (NFKD) and strip diacritics
+    - Replace whitespace with underscores
+    - Allow only a conservative subset of chars (alnum, dot, dash, underscore)
+    - Collapse repeated underscores and trim length to 255
+    Returns a safe ASCII filename; if input is falsy returns an empty string.
+    """
+    if not name:
+        return ""
+    try:
+        # basename only
+        base = os.path.basename(name)
+        # Normalize and remove diacritics
+        nk = unicodedata.normalize('NFKD', base)
+        no_diac = ''.join(c for c in nk if not unicodedata.combining(c))
+        # Replace spaces with underscore
+        replaced = re.sub(r"\s+", "_", no_diac)
+        # Keep only safe characters
+        safe = re.sub(r"[^A-Za-z0-9._\-]", "", replaced)
+        # Collapse repeated underscores/dots/dashes
+        safe = re.sub(r"_+", "_", safe)
+        safe = safe.strip('._-')
+        if not safe:
+            return ""
+        # Limit length
+        if len(safe) > 255:
+            safe = safe[:255]
+        return safe
+    except Exception:
+        return os.path.basename(name) or ""
+
 def convert_to_wav16_mono(src_path: str, dst_path: str) -> None:
     try:
         cmd = [FFMPEG_BIN, "-y", "-i", src_path, "-ac", "1", "-ar", "16000", "-vn", dst_path]
         result = subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         logger.info(f"Converted {src_path} to {dst_path}")
     except subprocess.CalledProcessError as e:
-        logger.error(f"FFmpeg conversion failed: {e.stderr.decode()}")
-        raise RuntimeError(f"Audio conversion failed: {e.stderr.decode()}")
+        stderr_text = e.stderr.decode() if e and getattr(e, 'stderr', None) else str(e)
+        logger.error(f"FFmpeg conversion failed: {stderr_text}")
+        # write stderr to a temp log for easier debugging from API
+        try:
+            os.makedirs(TMP_DIR, exist_ok=True)
+            stamp = int(time.time() * 1000)
+            err_path = os.path.join(TMP_DIR, f"ffmpeg_convert_error_{stamp}.log")
+            with open(err_path, "w", encoding="utf-8") as ef:
+                ef.write(stderr_text)
+            logger.info(f"Wrote ffmpeg stderr to {err_path}")
+        except Exception:
+            pass
+        raise RuntimeError(f"Audio conversion failed: {stderr_text}")
     except FileNotFoundError:
         logger.error("FFmpeg not found. Please install ffmpeg and add to PATH")
         raise RuntimeError("FFmpeg not installed")
@@ -152,25 +286,64 @@ def extract_features(path: str):
         import warnings
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
-            y, sr = librosa.load(path, sr=16000)
-        
-        mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13), axis=1)
-        
-        # More robust pitch extraction
-        pitch, magnitude = librosa.piptrack(y=y, sr=sr)
-        pitch_values = pitch[magnitude > np.median(magnitude)]
-        positive_pitch = pitch_values[pitch_values > 0]
-        pitch_mean = float(np.mean(positive_pitch)) if positive_pitch.size > 0 else 0.0
-        
-        # Safer tempo extraction
-        try:
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            tempo = float(tempo)
-        except Exception:
-            tempo = 120.0  # Default BPM if extraction fails
-        
+
+            # Choose MFCC config depending on FAST_MODE
+            n_mfcc = 13 if not FAST_MODE else 8
+            load_kwargs = {"sr": 16000}
+            if FAST_MODE:
+                # Only load a short prefix in fast mode to reduce I/O and CPU
+                load_kwargs["duration"] = 3.0
+
+            # Load audio once
+            y, sr = librosa.load(path, **load_kwargs)
+
+            # MFCC: prefer audio_features when available and not in FAST_MODE
+            mfcc = None
+            if audio_features is not None and not FAST_MODE:
+                try:
+                    mfcc = audio_features.extract_mfcc_mean(path, n_mfcc=n_mfcc, sr=sr, include_deltas=True)
+                except Exception:
+                    mfcc = None
+
+            if mfcc is None:
+                mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc), axis=1)
+
+            # Pitch: prefer more efficient YIN estimator when available
+            pitch_mean = 0.0
+            try:
+                # librosa.yin returns f0 per frame; take median of positive finite values
+                f0 = librosa.yin(y, fmin=50, fmax=500, sr=sr)
+                f0_pos = f0[np.isfinite(f0) & (f0 > 0)]
+                if f0_pos.size > 0:
+                    pitch_mean = float(np.median(f0_pos))
+            except Exception:
+                try:
+                    # fallback to piptrack
+                    pitch, magnitude = librosa.piptrack(y=y, sr=sr)
+                    pitch_values = pitch[magnitude > np.median(magnitude)]
+                    positive_pitch = pitch_values[pitch_values > 0]
+                    pitch_mean = float(np.mean(positive_pitch)) if positive_pitch.size > 0 else 0.0
+                except Exception:
+                    pitch_mean = 0.0
+
+            # Tempo: skip costly tempo estimation in FAST_MODE
+            if FAST_MODE:
+                tempo = 120.0
+            else:
+                try:
+                    tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+                    tempo = float(tempo)
+                except Exception:
+                    tempo = 120.0
+
         logger.info(f"Extracted features from {path}")
-        return {"mfcc": mfcc.tolist(), "pitch": pitch_mean, "tempo": tempo}
+
+        # Ensure mfcc is serializable list
+        if isinstance(mfcc, np.ndarray):
+            mfcc_list = mfcc.tolist()
+        else:
+            mfcc_list = list(mfcc)
+        return {"mfcc": mfcc_list, "pitch": pitch_mean, "tempo": tempo}
     except Exception as e:
         logger.error(f"Feature extraction failed for {path}: {e}")
         raise
@@ -242,7 +415,11 @@ def rescan_samples():
             "new_vocabs_added": len(new_vocabs),
             "new_vocabs": new_vocabs,
         }
-        logger.info(f"Rescan completed: {len(new_samples)} new samples, {len(new_vocabs)} new vocabs")
+        # Only log at INFO when there are new items; otherwise use DEBUG to reduce noise
+        if len(new_samples) or len(new_vocabs):
+            logger.info(f"Rescan completed: {len(new_samples)} new samples, {len(new_vocabs)} new vocabs")
+        else:
+            logger.debug(f"Rescan completed: {len(new_samples)} new samples, {len(new_vocabs)} new vocabs")
         return report
     except Exception as e:
         logger.error(f"Rescan failed: {e}")
