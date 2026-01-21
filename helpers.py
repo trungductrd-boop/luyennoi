@@ -319,36 +319,50 @@ def extract_features(path: str):
 
             # Choose MFCC config depending on FAST_MODE
             n_mfcc = 13 if not FAST_MODE else 8
-            load_kwargs = {"sr": 16000}
-            if FAST_MODE:
-                # Only load a short prefix in fast mode to reduce I/O and CPU
-                load_kwargs["duration"] = 3.0
 
-            # Load audio once
+            # Always limit duration to avoid long files hanging the extractor
+            load_kwargs = {"sr": 16000, "mono": True, "duration": 3.0}
+
+            logger.info("Loading audio for feature extraction: %s", path)
             y, sr = librosa.load(path, **load_kwargs)
+            logger.info("librosa.load done: sr=%s, samples=%d", sr, len(y))
+
+            # Trim leading/trailing silence to focus on speech content
+            try:
+                y_trimmed, _ = librosa.effects.trim(y, top_db=25)
+                logger.info("Trimmed silence: original_samples=%d trimmed_samples=%d", len(y), len(y_trimmed))
+                y = y_trimmed
+            except Exception:
+                logger.warning("librosa.effects.trim failed, continuing with original signal")
 
             # MFCC: prefer audio_features when available and not in FAST_MODE
-            mfcc = None
+            mfcc_vals = None
             if audio_features is not None and not FAST_MODE:
                 try:
-                    mfcc = audio_features.extract_mfcc_mean(path, n_mfcc=n_mfcc, sr=sr, include_deltas=True)
+                    mfcc_vals = audio_features.extract_mfcc_mean(path, n_mfcc=n_mfcc, sr=sr, include_deltas=True)
                 except Exception:
-                    mfcc = None
+                    mfcc_vals = None
 
-            if mfcc is None:
-                mfcc = np.mean(librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc), axis=1)
+            if mfcc_vals is None:
+                mf = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
+                # Limit number of frames to avoid very long matrices (keep ~3s * hop rate)
+                max_frames = 300
+                if mf.shape[1] > max_frames:
+                    mf = mf[:, :max_frames]
+                    logger.info("MFCC frames truncated to %d", max_frames)
+                logger.info("mfcc computed, shape=%s", mf.shape)
+                # Reduce to mean MFCC vector (time-averaged)
+                mfcc_vals = np.mean(mf, axis=1)
 
-            # Pitch: prefer more efficient YIN estimator when available
+            # Pitch estimation: attempt lightweight methods only
             pitch_mean = 0.0
             try:
-                # librosa.yin returns f0 per frame; take median of positive finite values
                 f0 = librosa.yin(y, fmin=50, fmax=500, sr=sr)
                 f0_pos = f0[np.isfinite(f0) & (f0 > 0)]
                 if f0_pos.size > 0:
                     pitch_mean = float(np.median(f0_pos))
             except Exception:
                 try:
-                    # fallback to piptrack
                     pitch, magnitude = librosa.piptrack(y=y, sr=sr)
                     pitch_values = pitch[magnitude > np.median(magnitude)]
                     positive_pitch = pitch_values[pitch_values > 0]
@@ -366,16 +380,16 @@ def extract_features(path: str):
                 except Exception:
                     tempo = 120.0
 
-        logger.info(f"Extracted features from {path}")
+        logger.info("Extracted features from %s", path)
 
         # Ensure mfcc is serializable list
-        if isinstance(mfcc, np.ndarray):
-            mfcc_list = mfcc.tolist()
+        if isinstance(mfcc_vals, np.ndarray):
+            mfcc_list = mfcc_vals.tolist()
         else:
-            mfcc_list = list(mfcc)
+            mfcc_list = list(mfcc_vals)
         return {"mfcc": mfcc_list, "pitch": pitch_mean, "tempo": tempo}
     except Exception as e:
-        logger.error(f"Feature extraction failed for {path}: {e}")
+        logger.exception("Feature extraction failed for %s", path)
         raise
 
 def compare_features_dicts(f1: dict, f2: dict):
