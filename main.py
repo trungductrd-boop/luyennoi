@@ -512,7 +512,7 @@ async def api_compare_json(payload: CompareJSON):
     return _compare_audio_paths(sample_path, user_temp_path, sample_uploaded_temp)
 
 
-def _compare_audio_paths(sample_path: str, user_temp_path: str, sample_uploaded_temp: bool = False) -> Dict[str, Any]:
+def _compare_audio_paths(sample_path: str, user_temp_path: str, sample_uploaded_temp: bool = False, auto_cleanup: bool = True) -> Dict[str, Any]:
     """Convert files, extract features, compare and cleanup. Returns response dict."""
     sample_conv = sample_path + ".conv.wav"
     user_conv = user_temp_path + ".conv.wav"
@@ -543,8 +543,8 @@ def _compare_audio_paths(sample_path: str, user_temp_path: str, sample_uploaded_
         raise HTTPException(status_code=500, detail=detail)
 
     try:
-        f1 = helpers.extract_features(sample_conv)
-        f2 = helpers.extract_features(user_conv)
+        f1 = _safe_extract(sample_conv, attempts=3, delay=0.2, timeout=30)
+        f2 = _safe_extract(user_conv, attempts=3, delay=0.2, timeout=30)
     except Exception as e:
         try:
             helpers.logger.error("Feature extraction failed for %s and/or %s: %s", sample_conv, user_conv, e, exc_info=True)
@@ -583,19 +583,23 @@ def _compare_audio_paths(sample_path: str, user_temp_path: str, sample_uploaded_
     if tempo_diff > 20:
         feedback += "\nTốc độ nói khác, thử chậm hoặc nhanh hơn chút."
 
-    # cleanup temp files
-    for p in (user_temp_path, user_conv, sample_conv):
-        try:
-            if os.path.exists(p):
-                os.remove(p)
-        except Exception:
-            pass
-    if sample_uploaded_temp:
-        try:
-            if os.path.exists(sample_path):
-                os.remove(sample_path)
-        except Exception:
-            pass
+    # cleanup temp files (only if auto_cleanup requested). When called from
+    # background workers we pass auto_cleanup=False and perform cleanup after
+    # the job result is persisted to avoid race conditions and to retain files
+    # for post-mortem debugging.
+    if auto_cleanup:
+        for p in (user_temp_path, user_conv, sample_conv):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        if sample_uploaded_temp:
+            try:
+                if os.path.exists(sample_path):
+                    os.remove(sample_path)
+            except Exception:
+                pass
 
     # keep copies of extracted features for the response, then release originals
     features_sample = f1
@@ -762,6 +766,40 @@ def _safe_convert(src: str, dst: str, attempts: int = 3, delay: float = 0.5) -> 
     raise RuntimeError(f"convert_to_wav16_mono failed for {src} -> {dst}: last_exc={last_exc}")
 
 
+def _safe_extract(path: str, attempts: int = 3, delay: float = 0.2, timeout: int = 30):
+    """Try extracting features multiple times if the file is transiently missing or extraction fails.
+
+    Uses `_extract_features_with_timeout` under the hood to bound execution time.
+    """
+    last_exc = None
+    for i in range(attempts):
+        if not path or not os.path.exists(path):
+            last_exc = FileNotFoundError(path)
+            try:
+                helpers.logger.warning("Extract attempt %d/%d: file missing: %s", i + 1, attempts, path)
+            except Exception:
+                pass
+            try:
+                time.sleep(delay)
+            except Exception:
+                pass
+            continue
+        try:
+            return _extract_features_with_timeout(path, timeout=timeout)
+        except Exception as e:
+            last_exc = e
+            try:
+                helpers.logger.warning("Extract attempt %d/%d failed for %s: %s", i + 1, attempts, path, e)
+            except Exception:
+                pass
+            try:
+                time.sleep(delay)
+            except Exception:
+                pass
+            continue
+    raise RuntimeError(f"extract_features failed for {path}: last_exc={last_exc}")
+
+
 def _job_scanner_loop():
     """Background loop that scans local job files and heals stale 'processing' jobs.
 
@@ -854,11 +892,31 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
 
             # Perform compare using existing helper (handles conversion & cleanup)
             try:
-                result = _compare_audio_paths(sample_path, user_temp_path, sample_uploaded_temp)
+                # Defer cleanup until after job result is persisted so operators can
+                # inspect files if something goes wrong.
+                result = _compare_audio_paths(sample_path, user_temp_path, sample_uploaded_temp, auto_cleanup=False)
                 payload = {"status": "done", "result": result}
                 _save_job_result(job_id, payload)
                 try:
                     schedule_notify_ws(job_id, payload)
+                except Exception:
+                    pass
+                # Now that result is saved, perform cleanup of temp files owned by this job.
+                try:
+                    sample_conv = sample_path + ".conv.wav"
+                    user_conv = user_temp_path + ".conv.wav"
+                    for p in (user_temp_path, user_conv, sample_conv):
+                        try:
+                            if os.path.exists(p):
+                                os.remove(p)
+                        except Exception:
+                            pass
+                    if sample_uploaded_temp:
+                        try:
+                            if os.path.exists(sample_path):
+                                os.remove(sample_path)
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 saved = True
@@ -891,8 +949,12 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
             return
 
         try:
-            f2 = _extract_features_with_timeout(user_conv, timeout=30)
+            f2 = _safe_extract(user_conv, attempts=3, delay=0.2, timeout=30)
         except Exception as e:
+            try:
+                helpers.logger.error("Feature extraction for %s failed: %s", user_conv, e, exc_info=True)
+            except Exception:
+                pass
             for p in (user_temp_path, user_conv):
                 try:
                     if os.path.exists(p):
