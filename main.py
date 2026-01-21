@@ -16,6 +16,7 @@ from pydantic import BaseModel
 import uvicorn
 import gc
 import asyncio
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import numpy as _np
@@ -767,16 +768,18 @@ def _safe_convert(src: str, dst: str, attempts: int = 3, delay: float = 0.5) -> 
 
 
 def _safe_extract(path: str, attempts: int = 3, delay: float = 0.2, timeout: int = 30):
-    """Try extracting features multiple times if the file is transiently missing or extraction fails.
+    """Wrapper an toàn cho `helpers.extract_features`.
 
-    Uses `_extract_features_with_timeout` under the hood to bound execution time.
+    - Thử nhiều lần nếu file vừa mới được tạo (filesystem visibility).
+    - Ghi đầy đủ stacktrace và lưu vào file log khi thất bại.
+    - Nếu `helpers.extract_features` trả None/empty thì coi là lỗi.
     """
     last_exc = None
     for i in range(attempts):
         if not path or not os.path.exists(path):
             last_exc = FileNotFoundError(path)
             try:
-                helpers.logger.warning("Extract attempt %d/%d: file missing: %s", i + 1, attempts, path)
+                helpers.logger.warning("Expected file missing before extract: %s (attempt %d/%d)", path, i + 1, attempts)
             except Exception:
                 pass
             try:
@@ -785,19 +788,42 @@ def _safe_extract(path: str, attempts: int = 3, delay: float = 0.2, timeout: int
                 pass
             continue
         try:
-            return _extract_features_with_timeout(path, timeout=timeout)
+            helpers.logger.info("Starting feature extract for %s (attempt %d/%d)", path, i + 1, attempts)
+            feats = helpers.extract_features(path)
+            if not feats:
+                raise RuntimeError("helpers.extract_features returned empty/None")
+            helpers.logger.info("Extract succeeded for %s", path)
+            return feats
         except Exception as e:
             last_exc = e
             try:
-                helpers.logger.warning("Extract attempt %d/%d failed for %s: %s", i + 1, attempts, path, e)
+                helpers.logger.warning("Extract attempt %d/%d failed for %s: %s", i + 1, attempts, path, repr(e))
             except Exception:
                 pass
+            # write full traceback to a diagnostic file for post-mortem
             try:
-                time.sleep(delay)
+                errdir = os.path.join("data", "tmp")
+                os.makedirs(errdir, exist_ok=True)
+                errfile = os.path.join(errdir, f"extract_error_{int(time.time()*1000)}.log")
+                with open(errfile, "w", encoding="utf-8") as ef:
+                    ef.write("Exception repr:\n")
+                    ef.write(repr(e) + "\n\n")
+                    ef.write("Stacktrace:\n")
+                    traceback.print_exc(file=ef)
+                helpers.logger.info("Wrote extract stacktrace to %s", errfile)
+            except Exception:
+                try:
+                    helpers.logger.exception("Failed to write extract stacktrace")
+                except Exception:
+                    pass
+            try:
+                time.sleep(delay * (i + 1))
             except Exception:
                 pass
             continue
-    raise RuntimeError(f"extract_features failed for {path}: last_exc={last_exc}")
+
+    msg = f"extract_features failed for {path}: last_exc={repr(last_exc)}"
+    raise RuntimeError(msg)
 
 
 def _job_scanner_loop():
