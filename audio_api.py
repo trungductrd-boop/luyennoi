@@ -1875,3 +1875,229 @@ def api_sync_manifest():
 		"audio_files": all_audio,
 		"server_timestamp": helpers._get_timestamp()
 	}
+
+
+# -------------------------
+# API: App-oriented recognize endpoint (always JSON)
+# -------------------------
+@router.post("/api/recognize", summary="Recognize/pronunciation endpoint for app compatibility")
+async def api_recognize(
+	request: Request,
+	file: UploadFile = File(...),
+	type: str = Form(...),
+	mode: Optional[str] = Form(None),
+	vocab_id: Optional[str] = Form(None),
+	expected: Optional[str] = Form(None),
+):
+	"""Endpoint tailored for mobile app integration.
+
+	Required fields: `file`, `type`.
+	Optional: `mode`, `vocab_id`, `expected`.
+
+	Always returns JSON. Synchronous processing that returns `job_id` and `status`.
+	"""
+	job_id = str(uuid.uuid4())[:8]
+
+	# Safety: ensure temp dir
+	try:
+		os.makedirs(helpers.TMP_DIR, exist_ok=True)
+	except Exception:
+		pass
+
+	# Read upload safely
+	try:
+		contents = await file.read()
+	except Exception as e:
+		return JSONResponse(status_code=400, content={"job_id": job_id, "status": "error", "message": f"Failed to read upload: {e}"})
+
+	if not contents:
+		return JSONResponse(status_code=400, content={"job_id": job_id, "status": "error", "message": "Empty file"})
+
+	if hasattr(helpers, "MAX_UPLOAD_BYTES") and len(contents) > helpers.MAX_UPLOAD_BYTES:
+		return JSONResponse(status_code=413, content={"job_id": job_id, "status": "error", "message": "File too large"})
+
+	# Write to temp and convert to wav16 mono
+	tmp_raw = os.path.join(helpers.TMP_DIR, f"in_{job_id}.bin")
+	tmp_wav = os.path.join(helpers.TMP_DIR, f"in_{job_id}.wav")
+	try:
+		with open(tmp_raw, "wb") as f:
+			f.write(contents)
+	except Exception as e:
+		return JSONResponse(status_code=500, content={"job_id": job_id, "status": "error", "message": f"Failed to store upload: {e}"})
+
+	# Try skip conversion when already WAV 16k mono
+	try:
+		skip_conv = False
+		if tmp_raw.lower().endswith('.wav'):
+			try:
+				with _wave.open(tmp_raw, 'rb') as wf:
+					if wf.getnchannels() == 1 and wf.getframerate() == 16000:
+						skip_conv = True
+			except Exception:
+				skip_conv = False
+
+		if skip_conv:
+			tmp_wav_path = tmp_raw
+		else:
+			try:
+				helpers.convert_to_wav16_mono(tmp_raw, tmp_wav)
+				tmp_wav_path = tmp_wav
+			except Exception:
+				# fallback: try to copy raw
+				try:
+					shutil.copy2(tmp_raw, tmp_wav)
+					tmp_wav_path = tmp_wav
+				except Exception as e:
+					return JSONResponse(status_code=500, content={"job_id": job_id, "status": "error", "message": f"Conversion failed: {e}"})
+	finally:
+		try:
+			if os.path.exists(tmp_raw) and tmp_raw != tmp_wav_path:
+				os.remove(tmp_raw)
+		except Exception:
+			pass
+
+	# Feature extraction
+	try:
+		user_features = helpers.extract_features(tmp_wav_path)
+	except Exception as e:
+		try:
+			if os.path.exists(tmp_wav_path):
+				os.remove(tmp_wav_path)
+		except Exception:
+			pass
+		return JSONResponse(status_code=500, content={"job_id": job_id, "status": "error", "message": f"Feature extraction failed: {e}"})
+
+	# Choose comparison set
+	helpers.load_persisted_store()
+	candidates = []  # list of tuples (sample_id, meta, path)
+
+	# If expected provided, prefer samples associated with that word/vocab
+	if expected:
+		target = expected.strip().lower()
+		# search persisted vocab and built-in VOCAB
+		for sid, meta in helpers.PERSISTED_STORE.get("samples", {}).items():
+			vid = meta.get("vocab_id")
+			word = None
+			if vid:
+				# try persisted lessons
+				for bucket in helpers.PERSISTED_STORE.get("lessons", {}).values():
+					for v in bucket:
+						if v.get("id") == vid:
+							word = v.get("word")
+							break
+					if word:
+						break
+				# try built-in VOCAB
+				if not word:
+					for bucket in helpers.VOCAB.values():
+						for v in bucket:
+							if v.get("id") == vid:
+								word = v.get("word")
+								break
+						if word:
+							break
+			# fallback: try filename heuristic
+			if not word:
+				fn = meta.get("filename", "")
+				m = re.match(r'^[\d\-_]+(.+)\.wav$', fn)
+				if m:
+					word = re.sub(r'[_\-]+', ' ', m.group(1)).strip()
+
+			if word and word.strip().lower() == target:
+				ref = os.path.join(helpers.SAMPLES_DIR, meta.get("filename"))
+				if os.path.exists(ref):
+					candidates.append((sid, meta, ref))
+
+	# If vocab_id given, filter by that
+	if vocab_id and not candidates:
+		for sid, meta in helpers.PERSISTED_STORE.get("samples", {}).items():
+			if meta.get("vocab_id") == vocab_id:
+				ref = os.path.join(helpers.SAMPLES_DIR, meta.get("filename"))
+				if os.path.exists(ref):
+					candidates.append((sid, meta, ref))
+
+	# If still empty, fallback to all samples
+	if not candidates:
+		for sid, meta in helpers.PERSISTED_STORE.get("samples", {}).items():
+			ref = os.path.join(helpers.SAMPLES_DIR, meta.get("filename"))
+			if os.path.exists(ref):
+				candidates.append((sid, meta, ref))
+
+	if not candidates:
+		try:
+			if os.path.exists(tmp_wav_path):
+				os.remove(tmp_wav_path)
+		except Exception:
+			pass
+		return JSONResponse(status_code=404, content={"job_id": job_id, "status": "error", "message": "No reference samples available on server"})
+
+	# Compare and pick best
+	best = None
+	for sid, meta, ref in candidates:
+		try:
+			ref_features = helpers.extract_features(ref)
+			mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
+			mfcc_score = max(0, 100 - mfcc_dist * 2)
+			pitch_score = max(0, 100 - pitch_diff * 0.5)
+			tempo_score = max(0, 100 - tempo_diff * 0.5)
+			overall = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
+			if not best or overall > best[0]:
+				best = (overall, sid, meta, ref, mfcc_dist, pitch_diff, tempo_diff)
+		except Exception:
+			continue
+
+	if not best:
+		try:
+			if os.path.exists(tmp_wav_path):
+				os.remove(tmp_wav_path)
+		except Exception:
+			pass
+		return JSONResponse(status_code=500, content={"job_id": job_id, "status": "error", "message": "Comparison failed"})
+
+	overall_score, sid, meta, ref_path, mfcc_dist, pitch_diff, tempo_diff = best
+
+	# Derive recognized text
+	vocab_info = _get_vocab_info(sid, meta)
+	recognized = expected.strip() if expected else (vocab_info.get("word") or "")
+
+	score_norm = round(max(0.0, min(1.0, overall_score / 100.0)), 4)
+	confidence = round(min(1.0, score_norm + 0.08), 4)
+
+	# hand_sign and mouth_shape: prefer metadata fields if present
+	hand_sign = meta.get("hand_sign") or (recognized.replace(' ', '_').lower() + ".png" if recognized else None)
+	mouth_shape = meta.get("mouth_shape") or ("open" if overall_score >= 60 else "closed")
+
+	# visual hints
+	if overall_score >= 80:
+		visual_level = "good"
+		color_hint = "green"
+	elif overall_score >= 60:
+		visual_level = "fair"
+		color_hint = "yellow"
+	else:
+		visual_level = "poor"
+		color_hint = "red"
+
+	advice = _get_feedback(overall_score)
+
+	# Cleanup
+	try:
+		if os.path.exists(tmp_wav_path):
+			os.remove(tmp_wav_path)
+	except Exception:
+		pass
+
+	response = {
+		"job_id": job_id,
+		"status": "done",
+		"recognized_text": recognized,
+		"score": score_norm,
+		"confidence": confidence,
+		"advice": advice,
+		"hand_sign": hand_sign,
+		"mouth_shape": mouth_shape,
+		"visual_level": visual_level,
+		"color_hint": color_hint,
+	}
+
+	return JSONResponse(status_code=200, content=response)
