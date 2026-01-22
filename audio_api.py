@@ -23,6 +23,8 @@ import json
 import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path as _Path
+import uuid as _uuid
 
 # Background executor for light async processing (placeholder for real queue)
 _default_workers = max(2, (os.cpu_count() or 2))
@@ -41,6 +43,53 @@ DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB
 # In-memory cache for extracted sample features to avoid repeated costly extraction
 SAMPLE_FEATURES: dict = {}
 SAMPLE_FEATURES_LOCK = threading.Lock()
+
+# Load audio_id_map.json at module import (used to validate vocab_id -> sample mapping)
+AUDIO_ID_MAP_PATH = _Path("data/samples/audio_id_map.json")
+AUDIO_ID_MAP: dict = {}
+try:
+	if AUDIO_ID_MAP_PATH.exists():
+		AUDIO_ID_MAP = json.loads(AUDIO_ID_MAP_PATH.read_text(encoding="utf-8")) or {}
+except Exception:
+	AUDIO_ID_MAP = {}
+
+
+def save_upload_streaming(upload: UploadFile, tmp_dir: str, max_bytes: int):
+	"""Save an UploadFile to a NamedTemporaryFile by streaming chunks.
+
+	Returns (tmp_path, total_bytes). Raises ValueError("payload_too_large") when
+	the upload exceeds max_bytes.
+	"""
+	from pathlib import Path
+	import tempfile
+
+	Path(tmp_dir).mkdir(parents=True, exist_ok=True)
+	suffix = _Path(upload.filename or "").suffix or ".bin"
+	tmp = tempfile.NamedTemporaryFile(delete=False, dir=tmp_dir, suffix=suffix)
+	total = 0
+	try:
+		with tmp as out:
+			while True:
+				chunk = upload.file.read(64 * 1024)
+				if not chunk:
+					break
+				total += len(chunk)
+				if total > int(max_bytes):
+					out.close()
+					try:
+						_Path(tmp.name).unlink()
+					except Exception:
+						pass
+					raise ValueError("payload_too_large")
+				out.write(chunk)
+	except Exception:
+		# ensure tempfile removed on unexpected error
+		try:
+			_Path(tmp.name).unlink()
+		except Exception:
+			pass
+		raise
+	return tmp.name, total
 
 
 def _extract_features_with_timeout(path: str, timeout: int = 30) -> Optional[dict]:
@@ -1353,19 +1402,21 @@ async def api_analyze_vocab(
 		if not upload:
 			return _default_compare_response("No user audio provided")
 
-		user_contents = await upload.read()
-		if len(user_contents) == 0:
-			return _default_compare_response("Empty user file")
-		if hasattr(helpers, "MAX_UPLOAD_BYTES") and len(user_contents) > helpers.MAX_UPLOAD_BYTES:
-			return _default_compare_response("File too large")
+		# Validate vocab mapping if provided (use audio_id_map.json)
+		if vocab_id and vocab_id not in AUDIO_ID_MAP:
+			return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found"})
 
 		os.makedirs(helpers.TMP_DIR, exist_ok=True)
 		created_tmp = True
+		# Save upload streaming to tmp file to avoid high memory usage
 		user_id = str(uuid.uuid4())[:8]
-		_, ext = os.path.splitext(upload.filename or "user.wav")
-		user_raw_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}{ext or '.wav'}")
-		with open(user_raw_path, "wb") as f:
-			f.write(user_contents)
+		try:
+			user_raw_path, total = save_upload_streaming(upload, helpers.TMP_DIR, getattr(helpers, "MAX_UPLOAD_BYTES", DEFAULT_UPLOAD_LIMIT))
+		except ValueError:
+			return _default_compare_response("File too large")
+		except Exception as e:
+			helpers.logger.error("Failed to save user upload for vocab analyze: %s", str(e))
+			return _default_compare_response("Failed to store upload")
 		user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
 
 		# If WAV and already 16k mono, skip conversion
@@ -1433,16 +1484,6 @@ async def api_analyze_vocab(
 			except Exception:
 				pass
 			return _default_compare_response("Feature extraction failed")
-
-			# Validate extracted features
-			if not user_features:
-				helpers.logger.error("Extracted user features empty (vocab)")
-				try:
-					if created_tmp and user_wav_path and os.path.exists(user_wav_path):
-						os.remove(user_wav_path)
-				except Exception:
-					pass
-				return _default_compare_response("Feature extraction produced no usable features")
 
 		# Compare against filtered set
 		matches = []
@@ -1929,32 +1970,31 @@ async def api_recognize(
 	"""
 	job_id = str(uuid.uuid4())[:8]
 
+	# Basic validation
+	if type != "audio":
+		return JSONResponse(status_code=400, content={"job_id": job_id, "status": "error", "error": "invalid_input", "detail": "type must be 'audio'"})
+	if mode == "vocab" and not vocab_id:
+		return JSONResponse(status_code=400, content={"error": "vocab_id required for mode=vocab"})
+	if vocab_id and vocab_id not in AUDIO_ID_MAP:
+		return JSONResponse(status_code=400, content={"job_id": job_id, "status": "error", "error": "invalid_input", "detail": "vocab_id not found"})
+
 	# Safety: ensure temp dir
 	try:
 		os.makedirs(helpers.TMP_DIR, exist_ok=True)
 	except Exception:
 		pass
 
-	# Read upload safely
+	# Save upload by streaming to disk to avoid loading into RAM
+	max_bytes = getattr(helpers, "MAX_UPLOAD_BYTES", DEFAULT_UPLOAD_LIMIT)
 	try:
-		contents = await file.read()
-	except Exception as e:
-		return JSONResponse(status_code=400, content={"job_id": job_id, "status": "error", "message": f"Failed to read upload: {e}"})
-
-	if not contents:
-		return JSONResponse(status_code=400, content={"job_id": job_id, "status": "error", "message": "Empty file"})
-
-	if hasattr(helpers, "MAX_UPLOAD_BYTES") and len(contents) > helpers.MAX_UPLOAD_BYTES:
+		tmp_raw, total = save_upload_streaming(file, helpers.TMP_DIR, max_bytes)
+	except ValueError:
 		return JSONResponse(status_code=413, content={"job_id": job_id, "status": "error", "message": "File too large"})
-
-	# Write to temp and convert to wav16 mono
-	tmp_raw = os.path.join(helpers.TMP_DIR, f"in_{job_id}.bin")
-	tmp_wav = os.path.join(helpers.TMP_DIR, f"in_{job_id}.wav")
-	try:
-		with open(tmp_raw, "wb") as f:
-			f.write(contents)
 	except Exception as e:
-		return JSONResponse(status_code=500, content={"job_id": job_id, "status": "error", "message": f"Failed to store upload: {e}"})
+		helpers.logger.error("Failed to save upload for job %s: %s", job_id, str(e))
+		return JSONResponse(status_code=500, content={"job_id": job_id, "status": "error", "message": "Failed to store upload"})
+
+	tmp_wav = os.path.join(helpers.TMP_DIR, f"in_{job_id}.wav")
 
 	# Try skip conversion when already WAV 16k mono
 	try:

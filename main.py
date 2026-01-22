@@ -12,6 +12,7 @@ from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Res
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from size_limit_middleware import MaxBodySizeMiddleware
 from pydantic import BaseModel
 import uvicorn
 import gc
@@ -59,6 +60,9 @@ app.add_middleware(
         "Cache-Control"
     ]
 )
+
+# Limit request body size (also enforce at reverse proxy in production)
+app.add_middleware(MaxBodySizeMiddleware, max_body_size=10 * 1024 * 1024)
 
 # include audio-related router (uploads, samples, lessons...)
 app.include_router(audio_router, prefix="/api", tags=["Audio & Vocab"])
