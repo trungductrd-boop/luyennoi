@@ -39,12 +39,41 @@ from audio_api import _extract_features_with_timeout, _build_match_entry, _get_c
 # helpers used for streaming saves and vocab mapping
 from audio_api import save_upload_streaming, AUDIO_ID_MAP, DEFAULT_UPLOAD_LIMIT, resolve_vocab_sample
 
+
+def resolve_sample_meta(sample_id: str):
+    """Resolve a sample's metadata without forcing loading entire store into memory.
+
+    Returns metadata dict or None.
+    """
+    # Check in-memory cache first
+    try:
+        m = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
+        if m:
+            return m
+    except Exception:
+        pass
+    # Fallback: read specific entry from disk
+    try:
+        return helpers.get_sample_metadata(sample_id)
+    except Exception:
+        return None
+
+def api_get_sample(sample_id: str):
+    meta = resolve_sample_meta(sample_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="sample_id not found")
+    return meta
+
 # --- FastAPI app setup ---
 app = FastAPI(
     title="Vietnamese Pronunciation Learning API",
     description="API for Vietnamese pronunciation practice with audio comparison",
     version="1.0.0"
 )
+
+# Register lightweight sample metadata endpoint after `app` exists to avoid
+# referencing `app` at import time (prevents NameError when module is imported).
+app.get("/sample/{sample_id}", summary="Fetch sample metadata by id (lazy)")(api_get_sample)
 
 # CORS middleware with proper headers for audio streaming
 app.add_middleware(
@@ -375,8 +404,7 @@ async def api_compare(
         sample_path = sample_temp_path
         sample_uploaded_temp = True
     elif sample_id:
-        helpers.load_persisted_store()
-        sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
+        sample_meta = resolve_sample_meta(sample_id)
         if not sample_meta:
             try:
                 os.remove(user_temp_path)
@@ -520,8 +548,7 @@ async def api_compare_json(payload: CompareJSON):
         sample_path = sample_temp_path
         sample_uploaded_temp = True
     elif payload.sample_id:
-        helpers.load_persisted_store()
-        sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(payload.sample_id)
+        sample_meta = resolve_sample_meta(payload.sample_id)
         if not sample_meta:
             try:
                 os.remove(user_temp_path)
@@ -1056,7 +1083,8 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
             return
 
         try:
-            helpers.load_persisted_store()
+            # We need the full samples listing for matching; force full load when auto-matching
+            helpers.load_full_persisted_store()
             samples_meta = helpers.PERSISTED_STORE.get("samples", {})
 
             # Attempt direct match by filename/sample id from upload name

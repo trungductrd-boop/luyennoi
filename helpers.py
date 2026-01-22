@@ -10,6 +10,7 @@ import librosa
 import numpy as np
 import logging
 import unicodedata
+import gc
  
 # Optional memory logging helper
 try:
@@ -127,6 +128,8 @@ def load_persisted_store():
     global PERSISTED_STORE
     global _PERSISTED_STORE_LOADED
     try:
+        # Optionally avoid loading large `samples` key into RAM.
+        LAZY_PERSISTED_LOAD = os.environ.get("LAZY_PERSISTED_LOAD", "1") in ("1", "true", "True")
         # If portalocker is available, acquire a shared lock while reading to avoid races
         if portalocker:
             # ensure lock file exists
@@ -135,7 +138,17 @@ def load_persisted_store():
                 portalocker.lock(lockf, portalocker.LockFlags.SHARED)
                 try:
                     with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
-                        PERSISTED_STORE = json.load(f)
+                        if LAZY_PERSISTED_LOAD:
+                            # load only top-level metadata (lessons, progress) to keep memory low
+                            tmp = json.load(f)
+                            PERSISTED_STORE = {
+                                "lessons": tmp.get("lessons", {}),
+                                "progress": tmp.get("progress", {}),
+                                # keep samples empty until needed
+                                "samples": {},
+                            }
+                        else:
+                            PERSISTED_STORE = json.load(f)
                 finally:
                     try:
                         portalocker.unlock(lockf)
@@ -143,7 +156,15 @@ def load_persisted_store():
                         pass
         else:
             with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
-                PERSISTED_STORE = json.load(f)
+                if LAZY_PERSISTED_LOAD:
+                    tmp = json.load(f)
+                    PERSISTED_STORE = {
+                        "lessons": tmp.get("lessons", {}),
+                        "progress": tmp.get("progress", {}),
+                        "samples": {},
+                    }
+                else:
+                    PERSISTED_STORE = json.load(f)
         # Avoid noisy INFO logs from multiple worker processes; use DEBUG for loads
         logger.debug(f"Loaded persisted store: {len(PERSISTED_STORE.get('samples', {}))} samples (pid={os.getpid()})")
         _PERSISTED_STORE_LOADED = True
@@ -222,6 +243,58 @@ def merged_vocab_for_lesson(lesson_id: str):
             v2["audio_url"] = f"/static/samples/{fn}" if fn else None
             result.append(v2)
     return result
+
+
+def get_sample_metadata(sample_id: str):
+    """Retrieve a single sample's metadata on-demand from the persisted store file.
+
+    This avoids keeping the entire `samples` dict in memory when LAZY_PERSISTED_LOAD is enabled.
+    """
+    try:
+        # Fast path: check in-memory cache
+        s = PERSISTED_STORE.get("samples", {})
+        if sample_id in s:
+            return s[sample_id]
+        # Otherwise read from disk and fetch the specific entry
+        with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
+            full = json.load(f)
+            samples = full.get("samples", {})
+            return samples.get(sample_id)
+    except Exception:
+        return None
+
+
+def load_full_persisted_store():
+    """Force-load the entire persisted store (including `samples`) into memory.
+
+    Use this only when callers need to iterate all samples. Avoid calling in tight
+    loops or per-request when `LAZY_PERSISTED_LOAD` is enabled.
+    """
+    global PERSISTED_STORE
+    global _PERSISTED_STORE_LOADED
+    try:
+        if portalocker:
+            open(LOCK_PATH, "a").close()
+            with open(LOCK_PATH, "r+") as lockf:
+                portalocker.lock(lockf, portalocker.LockFlags.SHARED)
+                try:
+                    with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
+                        PERSISTED_STORE = json.load(f)
+                finally:
+                    try:
+                        portalocker.unlock(lockf)
+                    except Exception:
+                        pass
+        else:
+            with open(VOCAB_STORE_FILE, "r", encoding="utf-8") as f:
+                PERSISTED_STORE = json.load(f)
+        PERSISTED_STORE.setdefault("lessons", {})
+        PERSISTED_STORE.setdefault("samples", {})
+        PERSISTED_STORE.setdefault("progress", {})
+        _PERSISTED_STORE_LOADED = True
+        return PERSISTED_STORE
+    except Exception:
+        return None
 
 
 def sanitize_filename(name: Optional[str]) -> str:
@@ -317,8 +390,12 @@ def extract_features(path: str):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
+
             # Choose MFCC config depending on FAST_MODE
             n_mfcc = 13 if not FAST_MODE else 8
+            # Use smaller FFT / hop settings to reduce memory and compute
+            n_fft = 512
+            hop_length = 256
 
             # Always limit duration to avoid long files hanging the extractor
             load_kwargs = {"sr": 16000, "mono": True, "duration": 3.0}
@@ -344,15 +421,22 @@ def extract_features(path: str):
                     mfcc_vals = None
 
             if mfcc_vals is None:
-                mf = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc)
-                # Limit number of frames to avoid very long matrices (keep ~3s * hop rate)
-                max_frames = 300
+                mf = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=n_mfcc, n_fft=n_fft, hop_length=hop_length)
+                # Compute a sensible max frames based on requested duration to avoid huge matrices
+                dur = float(load_kwargs.get("duration", 3.0) or 3.0)
+                max_frames = int((dur * sr) / float(hop_length)) + 10
                 if mf.shape[1] > max_frames:
                     mf = mf[:, :max_frames]
                     logger.info("MFCC frames truncated to %d", max_frames)
                 logger.info("mfcc computed, shape=%s", mf.shape)
                 # Reduce to mean MFCC vector (time-averaged)
                 mfcc_vals = np.mean(mf, axis=1)
+                # free large arrays asap
+                try:
+                    del mf
+                    gc.collect()
+                except Exception:
+                    pass
 
             # Pitch estimation: attempt lightweight methods only
             pitch_mean = 0.0
@@ -382,11 +466,24 @@ def extract_features(path: str):
 
         logger.info("Extracted features from %s", path)
 
-        # Ensure mfcc is serializable list
-        if isinstance(mfcc_vals, np.ndarray):
-            mfcc_list = mfcc_vals.tolist()
-        else:
-            mfcc_list = list(mfcc_vals)
+        # Ensure mfcc is serializable list and free arrays
+        try:
+            if isinstance(mfcc_vals, np.ndarray):
+                mfcc_list = mfcc_vals.tolist()
+            else:
+                mfcc_list = list(mfcc_vals)
+        finally:
+            try:
+                # Free large arrays and force GC to reclaim memory quickly
+                del mfcc_vals
+            except Exception:
+                pass
+            try:
+                del y
+            except Exception:
+                pass
+            gc.collect()
+
         return {"mfcc": mfcc_list, "pitch": pitch_mean, "tempo": tempo}
     except Exception as e:
         logger.exception("Feature extraction failed for %s", path)
