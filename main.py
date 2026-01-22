@@ -341,6 +341,48 @@ async def api_compare(
             helpers.logger.warning("Failed to log /compare request details (request_id=%s)", request_id)
         except Exception:
             pass
+    # --- DEBUG: developer requested mandatory debug prints ---
+    try:
+        # Print raw JSON body if present (best-effort; multipart forms may not have JSON)
+        try:
+            data = await request.json()
+            print("RAW BODY:", data)
+        except Exception:
+            pass
+
+        print("===== DEBUG =====")
+        print("Received vocab_id:", vocab_id, type(vocab_id))
+        # Build a lightweight VOCAB_INDEX for quick debug (keys forced to str)
+        VOCAB_INDEX = {}
+        try:
+            for lid, items in helpers.VOCAB.items():
+                for v in items:
+                    vid = v.get("id")
+                    if vid is not None:
+                        VOCAB_INDEX[str(vid)] = v
+        except Exception:
+            pass
+        try:
+            # include persisted lessons if already loaded
+            for lid, items in helpers.PERSISTED_STORE.get("lessons", {}).items():
+                for v in items:
+                    vid = v.get("id")
+                    if vid is not None:
+                        VOCAB_INDEX[str(vid)] = v
+        except Exception:
+            pass
+        print("VOCAB_INDEX keys sample:", list(VOCAB_INDEX.keys())[:10])
+        print("VOCAB_INDEX size:", len(VOCAB_INDEX))
+        print("=================")
+    except Exception:
+        pass
+
+    # Quick defensive cast: ensure vocab_id is string to match JSON keys
+    try:
+        if vocab_id is not None:
+            vocab_id = str(vocab_id)
+    except Exception:
+        pass
     if not upload:
         # Keep responses JSON-shaped for client compatibility
         return JSONResponse(status_code=400, content={"error": "no_user_file", "detail": "No user file provided", "request_id": request_id})

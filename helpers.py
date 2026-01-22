@@ -596,12 +596,5 @@ def normalize_match_key(name: Optional[str]) -> str:
         except Exception:
             return ""
 
-# Multimodal helpers are provided in a separate module helpers_multimodal.py.
-# Attempt relative import first, fall back to top-level import, else set to None.
-try:
-    from . import helpers_multimodal as helpers_multimodal
-except Exception:
-    try:
-        import helpers_multimodal as helpers_multimodal
-    except Exception:
-        helpers_multimodal = None
+# Multimodal visual/mouth analysis has been removed intentionally.
+# No multimodal import to avoid any accidental face/mouth analysis code paths.
