@@ -1,0 +1,135 @@
+{
+  "lessons": {
+    "1": {
+      "1_100": {
+        "word": "Xin chào",
+        "meaning": "Hello",
+        "example": "Xin chào bạn!",
+        "audio_filename": "xin_chao.wav"
+      }
+    }
+  },
+  "samples": {
+    "3f63a43a": {
+      "filename": "anh_trai.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "38b04353": {
+      "filename": "ba.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "4271ec18": {
+      "filename": "ban_khoe_khong.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "41ed0dab": {
+      "filename": "bo.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "e68070f9": {
+      "filename": "cam_on.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "90bbf279": {
+      "filename": "chao_buoi_sang.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "dad5ba97": {
+      "filename": "chao_buoi_toi.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "8b797763": {
+      "filename": "chong.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "c14ef141": {
+      "filename": "con_gai.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "3e8bc98f": {
+      "filename": "con_trai.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "09d2c5c6": {
+      "filename": "em_gai.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "6ff2f516": {
+      "filename": "gia_dinh.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "98f47f27": {
+      "filename": "hen_gap_lai.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "b54109df": {
+      "filename": "khong.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "8a23874c": {
+      "filename": "me.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "7cc53589": {
+      "filename": "ong.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "fcb23258": {
+      "filename": "rat_vui_duoc_gap_ban.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "f49f94df": {
+      "filename": "tam_biet.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "2f0475a0": {
+      "filename": "ten_toi_la.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "8eeedbfd": {
+      "filename": "toi_khoe.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "f16405c5": {
+      "filename": "vang1.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "00c76c94": {
+      "filename": "vo.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    },
+    "0b5f1e23": {
+      "filename": "xin_chao.wav",
+      "lesson_id": "1",
+      "vocab_id": "1_100"
+    },
+    "e1414db3": {
+      "filename": "banh_mi.wav",
+      "lesson_id": null,
+      "vocab_id": null
+    }
+  },
+  "progress": {}
+}

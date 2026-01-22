@@ -10,476 +10,76 @@
     }
   },
   "samples": {
-    "3f63a43a": {
-      "filename": "anh_trai.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "38b04353": {
-      "filename": "ba.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "4271ec18": {
-      "filename": "ban_khoe_khong.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "41ed0dab": {
-      "filename": "bo.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "e68070f9": {
-      "filename": "cam_on.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "90bbf279": {
-      "filename": "chao_buoi_sang.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "dad5ba97": {
-      "filename": "chao_buoi_toi.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "8b797763": {
-      "filename": "chong.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "c14ef141": {
-      "filename": "con_gai.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "3e8bc98f": {
-      "filename": "con_trai.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "09d2c5c6": {
-      "filename": "em_gai.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "6ff2f516": {
-      "filename": "gia_dinh.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "98f47f27": {
-      "filename": "hen_gap_lai.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "b54109df": {
-      "filename": "khong.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "8a23874c": {
-      "filename": "me.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "7cc53589": {
-      "filename": "ong.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "fcb23258": {
-      "filename": "rat_vui_duoc_gap_ban.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "f49f94df": {
-      "filename": "tam_biet.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "2f0475a0": {
-      "filename": "ten_toi_la.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "8eeedbfd": {
-      "filename": "toi_khoe.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "f16405c5": {
-      "filename": "vang1.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "00c76c94": {
-      "filename": "vo.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "0b5f1e23": {
-      "filename": "xin_chao.wav",
-      "lesson_id": "1",
-      "vocab_id": "1_100"
-    },
-    "e1414db3": {
-      "filename": "banh_mi.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "170c9a86": {
-      "filename": "bo.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "bc55c859": {
-      "filename": "ca.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "214bad09": {
-      "filename": "ca.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "604783fe": {
-      "filename": "ca_phe.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "b59085d6": {
-      "filename": "cam.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "72049e41": {
-      "filename": "chim.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "7a6554c7": {
-      "filename": "cho.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "b824a2bd": {
-      "filename": "den.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "2e80fa59": {
-      "filename": "do.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "9e5c5001": {
-      "filename": "ga.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "9dda3347": {
-      "filename": "heo.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "5b23d207": {
-      "filename": "meo.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "b325559b": {
-      "filename": "nuoc.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "6422ff30": {
-      "filename": "pho.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "2c36e129": {
-      "filename": "sua.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "053c9931": {
-      "filename": "thit.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "f6c4e8de": {
-      "filename": "tim.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "0cb066af": {
-      "filename": "tra.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "695627d9": {
-      "filename": "trang.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "757270de": {
-      "filename": "vang2.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "6025a640": {
-      "filename": "xanh_duong.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "6e3118d6": {
-      "filename": "xanh_la.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "b0026a51": {
-      "filename": "anh_trai.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "81d0b725": {
-      "filename": "banh_mi.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "6567f205": {
-      "filename": "ban_khoe_khong.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "daec192d": {
-      "filename": "ca.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "084b5709": {
-      "filename": "cam.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "9e9e3b73": {
-      "filename": "caphe.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "202a5795": {
-      "filename": "chim.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "c988ac27": {
-      "filename": "cho.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "fa4a8cdc": {
-      "filename": "den.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "3021bf7d": {
-      "filename": "do.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "03ec988b": {
-      "filename": "ga.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "5e6eb2c7": {
-      "filename": "heo.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "ae2066a8": {
-      "filename": "meo.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "9c63d01b": {
-      "filename": "nuoc.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "2b901073": {
-      "filename": "pho.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "d40cb03c": {
-      "filename": "sua.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "5321b9d5": {
-      "filename": "thit.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "6ca47d05": {
-      "filename": "tim.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "71f4769c": {
-      "filename": "tra.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "cef1a765": {
-      "filename": "trang.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "2d81fcde": {
-      "filename": "vang1.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "d0b4c8d8": {
-      "filename": "vang2.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "bd6aceee": {
-      "filename": "xanh_duong.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "febecd22": {
-      "filename": "xanh_la.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "589a009c": {
-      "filename": "anh_trai.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "a446f134": {
-      "filename": "banh_mi.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "5546c4de": {
-      "filename": "ban_khoe_khong.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "ac99a920": {
-      "filename": "ca.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "7b3106e4": {
-      "filename": "cam.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "da1e1ed1": {
-      "filename": "caphe.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "c412c613": {
-      "filename": "chim.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "3a12f812": {
-      "filename": "cho.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "4a69c6c7": {
-      "filename": "den.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "3168cc31": {
-      "filename": "do.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "45e14f7f": {
-      "filename": "ga.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "82d1612f": {
-      "filename": "heo.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "eddbf9a6": {
-      "filename": "meo.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "da72a002": {
-      "filename": "nuoc.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "548055bd": {
-      "filename": "pho.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "fc8cc999": {
-      "filename": "sua.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "c8cc2af9": {
-      "filename": "thit.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "459191c7": {
-      "filename": "tim.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "a06f68a3": {
-      "filename": "tra.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "e9ad7a1e": {
-      "filename": "trang.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "58203356": {
-      "filename": "vang1.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "594fe4cd": {
-      "filename": "vang2.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "e7a68c01": {
-      "filename": "xanh_duong.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    },
-    "c5478423": {
-      "filename": "xanh_la.wav",
-      "lesson_id": null,
-      "vocab_id": null
-    }
+    "3f63a43a": {"filename": "assets/samples/anhtrai.wav", "lesson_id": null, "vocab_id": null},
+    "38b04353": {"filename": "assets/samples/ba.wav", "lesson_id": null, "vocab_id": null},
+    "4271ec18": {"filename": "assets/samples/bankhoekhong.wav", "lesson_id": null, "vocab_id": null},
+    "41ed0dab": {"filename": "assets/samples/bo.wav", "lesson_id": null, "vocab_id": null},
+    "e68070f9": {"filename": "assets/samples/cam_on.wav", "lesson_id": null, "vocab_id": null},
+    "90bbf279": {"filename": "assets/samples/chao_buoi_sang.wav", "lesson_id": null, "vocab_id": null},
+    "dad5ba97": {"filename": "assets/samples/chao_buoi_toi.wav", "lesson_id": null, "vocab_id": null},
+    "8b797763": {"filename": "assets/samples/chong.wav", "lesson_id": null, "vocab_id": null},
+    "c14ef141": {"filename": "assets/samples/con_gai.wav", "lesson_id": null, "vocab_id": null},
+    "3e8bc98f": {"filename": "assets/samples/con_trai.wav", "lesson_id": null, "vocab_id": null},
+    "09d2c5c6": {"filename": "assets/samples/em_gai.wav", "lesson_id": null, "vocab_id": null},
+    "6ff2f516": {"filename": "assets/samples/gia_dinh.wav", "lesson_id": null, "vocab_id": null},
+    "98f47f27": {"filename": "assets/samples/hen_gap_lai.wav", "lesson_id": null, "vocab_id": null},
+    "b54109df": {"filename": "assets/samples/khong.wav", "lesson_id": null, "vocab_id": null},
+    "8a23874c": {"filename": "assets/samples/me.wav", "lesson_id": null, "vocab_id": null},
+    "7cc53589": {"filename": "assets/samples/ong.wav", "lesson_id": null, "vocab_id": null},
+    "fcb23258": {"filename": "assets/samples/rat_vui_duoc_gap_ban.wav", "lesson_id": null, "vocab_id": null},
+    "f49f94df": {"filename": "assets/samples/tam_biet.wav", "lesson_id": null, "vocab_id": null},
+    "2f0475a0": {"filename": "assets/samples/ten_toi_la.wav", "lesson_id": null, "vocab_id": null},
+    "8eeedbfd": {"filename": "assets/samples/toi_khoe.wav", "lesson_id": null, "vocab_id": null},
+    "f16405c5": {"filename": "assets/samples/vang1.wav", "lesson_id": null, "vocab_id": null},
+    "00c76c94": {"filename": "assets/samples/vo.wav", "lesson_id": null, "vocab_id": null},
+    "0b5f1e23": {"filename": "assets/samples/xin_chao.wav", "lesson_id": "1", "vocab_id": "1_100"},
+    "e1414db3": {"filename": "assets/samples/banhmi.wav", "lesson_id": null, "vocab_id": null},
+    "170c9a86": {"filename": "assets/samples/bo.wav", "lesson_id": null, "vocab_id": null},
+    "bc55c859": {"filename": "assets/samples/ca.wav", "lesson_id": null, "vocab_id": null},
+    "214bad09": {"filename": "assets/samples/ca.wav", "lesson_id": null, "vocab_id": null},
+    "604783fe": {"filename": "assets/samples/caphe.wav", "lesson_id": null, "vocab_id": null},
+    "b59085d6": {"filename": "assets/samples/cam.wav", "lesson_id": null, "vocab_id": null},
+    "72049e41": {"filename": "assets/samples/chim.wav", "lesson_id": null, "vocab_id": null},
+    "7a6554c7": {"filename": "assets/samples/cho.wav", "lesson_id": null, "vocab_id": null},
+    "b824a2bd": {"filename": "assets/samples/den.wav", "lesson_id": null, "vocab_id": null},
+    "2e80fa59": {"filename": "assets/samples/do.wav", "lesson_id": null, "vocab_id": null},
+    "9e5c5001": {"filename": "assets/samples/ga.wav", "lesson_id": null, "vocab_id": null},
+    "9dda3347": {"filename": "assets/samples/heo.wav", "lesson_id": null, "vocab_id": null},
+    "5b23d207": {"filename": "assets/samples/meo.wav", "lesson_id": null, "vocab_id": null},
+    "b325559b": {"filename": "assets/samples/nuoc.wav", "lesson_id": null, "vocab_id": null},
+    "6422ff30": {"filename": "assets/samples/pho.wav", "lesson_id": null, "vocab_id": null},
+    "2c36e129": {"filename": "assets/samples/sua.wav", "lesson_id": null, "vocab_id": null},
+    "053c9931": {"filename": "assets/samples/thit.wav", "lesson_id": null, "vocab_id": null},
+    "f6c4e8de": {"filename": "assets/samples/tim.wav", "lesson_id": null, "vocab_id": null},
+    "0cb066af": {"filename": "assets/samples/tra.wav", "lesson_id": null, "vocab_id": null},
+    "695627d9": {"filename": "assets/samples/trang.wav", "lesson_id": null, "vocab_id": null},
+    "757270de": {"filename": "assets/samples/vang2.wav", "lesson_id": null, "vocab_id": null},
+    "6025a640": {"filename": "assets/samples/xanh_duong.wav", "lesson_id": null, "vocab_id": null},
+    "6e3118d6": {"filename": "assets/samples/xanh_la.wav", "lesson_id": null, "vocab_id": null},
+    "b0026a51": {"filename": "assets/samples/anhtrai.wav", "lesson_id": null, "vocab_id": null},
+    "81d0b725": {"filename": "assets/samples/banhmi.wav", "lesson_id": null, "vocab_id": null},
+    "6567f205": {"filename": "assets/samples/bankhoekhong.wav", "lesson_id": null, "vocab_id": null},
+    "daec192d": {"filename": "assets/samples/ca.wav", "lesson_id": null, "vocab_id": null},
+    "084b5709": {"filename": "assets/samples/cam.wav", "lesson_id": null, "vocab_id": null},
+    "9e9e3b73": {"filename": "assets/samples/caphe.wav", "lesson_id": null, "vocab_id": null},
+    "202a5795": {"filename": "assets/samples/chim.wav", "lesson_id": null, "vocab_id": null},
+    "c988ac27": {"filename": "assets/samples/cho.wav", "lesson_id": null, "vocab_id": null},
+    "fa4a8cdc": {"filename": "assets/samples/den.wav", "lesson_id": null, "vocab_id": null},
+    "3021bf7d": {"filename": "assets/samples/do.wav", "lesson_id": null, "vocab_id": null},
+    "03ec988b": {"filename": "assets/samples/ga.wav", "lesson_id": null, "vocab_id": null},
+    "5e6eb2c7": {"filename": "assets/samples/heo.wav", "lesson_id": null, "vocab_id": null},
+    "ae2066a8": {"filename": "assets/samples/meo.wav", "lesson_id": null, "vocab_id": null},
+    "9c63d01b": {"filename": "assets/samples/nuoc.wav", "lesson_id": null, "vocab_id": null},
+    "2b901073": {"filename": "assets/samples/pho.wav", "lesson_id": null, "vocab_id": null},
+    "d40cb03c": {"filename": "assets/samples/sua.wav", "lesson_id": null, "vocab_id": null},
+    "5321b9d5": {"filename": "assets/samples/thit.wav", "lesson_id": null, "vocab_id": null},
+    "6ca47d05": {"filename": "assets/samples/tim.wav", "lesson_id": null, "vocab_id": null},
+    "71f4769c": {"filename": "assets/samples/tra.wav", "lesson_id": null, "vocab_id": null},
+    "cef1a765": {"filename": "assets/samples/trang.wav", "lesson_id": null, "vocab_id": null},
+    "2d81fcde": {"filename": "assets/samples/vang1.wav", "lesson_id": null, "vocab_id": null},
+    "d0b4c8d8": {"filename": "assets/samples/vang2.wav", "lesson_id": null, "vocab_id": null},
+    "bd6aceee": {"filename": "assets/samples/xanh_duong.wav", "lesson_id": null, "vocab_id": null},
+    "febecd22": {"filename": "assets/samples/xanh_la.wav", "lesson_id": null, "vocab_id": null}
   },
   "progress": {}
 }
