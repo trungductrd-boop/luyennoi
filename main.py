@@ -341,17 +341,24 @@ async def api_compare(
             helpers.logger.warning("Failed to log /compare request details (request_id=%s)", request_id)
         except Exception:
             pass
-    # --- DEBUG: developer requested mandatory debug prints ---
+    # --- DEBUG: developer requested mandatory debug logs ---
     try:
-        # Print raw JSON body if present (best-effort; multipart forms may not have JSON)
+        # Quick defensive cast: ensure vocab_id is string to match JSON keys
         try:
-            data = await request.json()
-            print("RAW BODY:", data)
+            if vocab_id is not None:
+                vocab_id = str(vocab_id)
         except Exception:
             pass
 
-        print("===== DEBUG =====")
-        print("Received vocab_id:", vocab_id, type(vocab_id))
+        # Print raw JSON body if present (best-effort; multipart forms may not have JSON)
+        try:
+            data = await request.json()
+            helpers.logger.info("RAW BODY: %s", data)
+        except Exception:
+            pass
+
+        helpers.logger.info("===== DEBUG =====")
+        helpers.logger.info("Received vocab_id: %s %s", vocab_id, type(vocab_id))
         # Build a lightweight VOCAB_INDEX for quick debug (keys forced to str)
         VOCAB_INDEX = {}
         try:
@@ -371,18 +378,14 @@ async def api_compare(
                         VOCAB_INDEX[str(vid)] = v
         except Exception:
             pass
-        print("VOCAB_INDEX keys sample:", list(VOCAB_INDEX.keys())[:10])
-        print("VOCAB_INDEX size:", len(VOCAB_INDEX))
-        print("=================")
+        helpers.logger.info("VOCAB_INDEX keys sample: %s", list(VOCAB_INDEX.keys())[:10])
+        helpers.logger.info("VOCAB_INDEX size: %d", len(VOCAB_INDEX))
+        # Check existence
+        if vocab_id is not None and vocab_id not in VOCAB_INDEX:
+            helpers.logger.warning("NOT FOUND vocab_id %s", vocab_id)
+        helpers.logger.info("=================")
     except Exception:
-        pass
-
-    # Quick defensive cast: ensure vocab_id is string to match JSON keys
-    try:
-        if vocab_id is not None:
-            vocab_id = str(vocab_id)
-    except Exception:
-        pass
+        helpers.logger.exception("Debug logging failed")
     if not upload:
         # Keep responses JSON-shaped for client compatibility
         return JSONResponse(status_code=400, content={"error": "no_user_file", "detail": "No user file provided", "request_id": request_id})
