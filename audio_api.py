@@ -11,6 +11,7 @@ import re
 import wave as _wave
 
 import helpers
+from collections import OrderedDict
 from pydantic import BaseModel, field_validator
 
 router = APIRouter()
@@ -27,11 +28,11 @@ from pathlib import Path as _Path
 import uuid as _uuid
 
 # Background executor for light async processing (placeholder for real queue)
-_default_workers = max(2, (os.cpu_count() or 2))
-if getattr(helpers, 'FAST_MODE', False):
-	executor = ThreadPoolExecutor(max_workers=2)
-else:
-	executor = ThreadPoolExecutor(max_workers=max(4, _default_workers))
+# Use a conservative default for max workers to limit RAM usage; allow env override.
+_default_workers = max(1, (os.cpu_count() or 1))
+_env_workers = int(os.environ.get("AUDIO_API_MAX_WORKERS", "2"))
+max_workers = 1 if getattr(helpers, 'FAST_MODE', False) else min(_env_workers, _default_workers)
+executor = ThreadPoolExecutor(max_workers=max_workers)
 
 # In-memory task store (task_id -> meta)
 UPLOAD_TASKS: dict = {}
@@ -40,18 +41,27 @@ UPLOAD_TASKS: dict = {}
 DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB
 
 
-# In-memory cache for extracted sample features to avoid repeated costly extraction
-SAMPLE_FEATURES: dict = {}
+# In-memory cache for extracted sample features (bounded LRU) to avoid unbounded growth
+SAMPLE_FEATURES: "OrderedDict[str, dict]" = OrderedDict()
 SAMPLE_FEATURES_LOCK = threading.Lock()
+# Max cached sample features entries (env override)
+SAMPLE_FEATURES_MAX = int(os.environ.get("SAMPLE_FEATURES_MAX", "200"))
 
-# Load audio_id_map.json at module import (used to validate vocab_id -> sample mapping)
+# Lazy-load audio_id_map.json on first use to avoid loading large maps at import time
 AUDIO_ID_MAP_PATH = _Path("data/samples/audio_id_map.json")
-AUDIO_ID_MAP: dict = {}
-try:
-	if AUDIO_ID_MAP_PATH.exists():
-		AUDIO_ID_MAP = json.loads(AUDIO_ID_MAP_PATH.read_text(encoding="utf-8")) or {}
-except Exception:
-	AUDIO_ID_MAP = {}
+AUDIO_ID_MAP: Optional[dict] = None
+
+def _ensure_audio_id_map():
+	global AUDIO_ID_MAP
+	if AUDIO_ID_MAP is not None:
+		return
+	try:
+		if AUDIO_ID_MAP_PATH.exists():
+			AUDIO_ID_MAP = json.loads(AUDIO_ID_MAP_PATH.read_text(encoding="utf-8")) or {}
+		else:
+			AUDIO_ID_MAP = {}
+	except Exception:
+		AUDIO_ID_MAP = {}
 
 
 def save_upload_streaming(upload: UploadFile, tmp_dir: str, max_bytes: int):
@@ -113,6 +123,25 @@ def _get_cached_features(path: str) -> Optional[dict]:
 		return json.loads(json.dumps(v)) if v is not None else None
 
 
+def _store_cached_features(path: str, feats: dict):
+	"""Store features in bounded LRU cache."""
+	if not path or feats is None:
+		return
+	key = os.path.abspath(path)
+	with SAMPLE_FEATURES_LOCK:
+		SAMPLE_FEATURES[key] = feats
+		try:
+			SAMPLE_FEATURES.move_to_end(key)
+		except Exception:
+			pass
+		# Evict oldest entries if over capacity
+		while len(SAMPLE_FEATURES) > (SAMPLE_FEATURES_MAX or 200):
+			try:
+				SAMPLE_FEATURES.popitem(last=False)
+			except Exception:
+				break
+
+
 def _build_match_entry(sample_id: str, meta: dict, ref_path: str, user_features: dict) -> Optional[dict]:
 	"""Build a match entry for a candidate sample.
 	Returns a dict with sample_id, filename, overall_score, and details.
@@ -122,10 +151,9 @@ def _build_match_entry(sample_id: str, meta: dict, ref_path: str, user_features:
 		feats = _get_cached_features(ref_path)
 		if feats is None:
 			feats = _extract_features_with_timeout(ref_path, timeout=30)
-			# store into cache
+			# store into bounded cache
 			try:
-				with SAMPLE_FEATURES_LOCK:
-					SAMPLE_FEATURES[os.path.abspath(ref_path)] = feats
+				_store_cached_features(ref_path, feats)
 			except Exception:
 				pass
 
@@ -199,8 +227,7 @@ def warm_sample_cache_background(limit: Optional[int] = None, max_workers: int =
 	def _extract_and_store(sid: str, path: str):
 		try:
 			feats = _extract_features_with_timeout(path, timeout=30)
-			with SAMPLE_FEATURES_LOCK:
-				SAMPLE_FEATURES[os.path.abspath(path)] = feats
+			_store_cached_features(path, feats)
 		except Exception:
 			pass
 
@@ -835,8 +862,10 @@ async def api_analyze_compare(
 			return _default_compare_response("type must be 'audio'")
 		if mode == "vocab" and not vocab_id:
 			return JSONResponse(status_code=400, content={"error": "vocab_id required for mode=vocab"})
-		if vocab_id and vocab_id not in AUDIO_ID_MAP:
-			return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found"})
+		if vocab_id:
+			_ensure_audio_id_map()
+			if AUDIO_ID_MAP is None or vocab_id not in AUDIO_ID_MAP:
+				return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found"})
 
 		# Stream save to temp to avoid reading whole file into memory
 		os.makedirs(helpers.TMP_DIR, exist_ok=True)
@@ -1666,8 +1695,10 @@ async def api_analyze_vocab(
 			return _default_compare_response("No user audio provided")
 
 		# Validate vocab mapping if provided (use audio_id_map.json)
-		if vocab_id and vocab_id not in AUDIO_ID_MAP:
-			return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found"})
+		if vocab_id:
+			_ensure_audio_id_map()
+			if AUDIO_ID_MAP is None or vocab_id not in AUDIO_ID_MAP:
+				return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found"})
 
 		os.makedirs(helpers.TMP_DIR, exist_ok=True)
 		created_tmp = True

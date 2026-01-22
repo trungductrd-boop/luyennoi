@@ -6,8 +6,7 @@ import subprocess
 from typing import Optional
 from datetime import datetime
 import time
-import librosa
-import numpy as np
+# Delay importing heavy audio libraries until needed (import inside functions)
 import logging
 import unicodedata
 import gc
@@ -387,6 +386,9 @@ def extract_features(path: str):
     try:
         # Suppress librosa warnings
         import warnings
+        # Import heavy audio libraries locally to avoid loading them at module import
+        import librosa
+        import numpy as np
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
 
@@ -490,6 +492,8 @@ def extract_features(path: str):
         raise
 
 def compare_features_dicts(f1: dict, f2: dict):
+    # Import numpy locally to avoid module-level memory use when unused
+    import numpy as np
     a = np.array(f1["mfcc"])
     b = np.array(f2["mfcc"])
     mfcc_dist = float(np.linalg.norm(a - b))
