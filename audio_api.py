@@ -1333,17 +1333,44 @@ def resolve_vocab_sample(vocab_id: Optional[str], request_id: Optional[str] = No
 				sample_id = vid
 				mapped = AUDIO_ID_MAP.get(vid)
 			else:
-				# try matching by basename
+				# try fuzzy matching by normalized basename using helpers.normalize_match_key
 				sample_id = None
 				mapped = None
+				try:
+					target_base = os.path.splitext(os.path.basename(str(vid)))[0]
+					target_key = helpers.normalize_match_key(target_base)
+				except Exception:
+					target_key = helpers.normalize_match_key(str(vid))
 				for k, v in AUDIO_ID_MAP.items():
 					try:
-						if os.path.basename(v) == vid or os.path.basename(v) == os.path.basename(vid):
+						cand_base = os.path.splitext(os.path.basename(v))[0]
+						cand_key = helpers.normalize_match_key(cand_base)
+						if cand_key and target_key and (cand_key == target_key or cand_key.endswith(target_key) or target_key.endswith(cand_key)):
 							sample_id = k
 							mapped = v
 							break
 					except Exception:
 						continue
+				# fallback: try persisted store matching by sample id, vocab_id, or normalized filename
+				if not mapped:
+					try:
+						helpers.load_persisted_store()
+						for sid, meta in helpers.PERSISTED_STORE.get("samples", {}).items():
+							fn = meta.get("filename") or ""
+							if sid == vid or meta.get("vocab_id") == vid:
+								mapped = fn
+								sample_id = sid
+								break
+							# normalized filename compare
+							try:
+								if helpers.normalize_match_key(os.path.splitext(fn)[0]) == target_key:
+									mapped = fn
+									sample_id = sid
+									break
+							except Exception:
+								continue
+					except Exception:
+						pass
 
 		if not mapped:
 			return None, None
