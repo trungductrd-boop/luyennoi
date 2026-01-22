@@ -6,6 +6,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 import logging
 from . import helpers
+from flask import current_app
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -34,9 +35,24 @@ def compare():
         orig_name = request.form.get('filename') or 'no_name'
         orig_name = helpers.sanitize_filename(orig_name) or orig_name
 
+    # Validate/resolve vocab_id early to ensure correct asset mapping
+    found, resolved_vid, asset_path, err = helpers.resolve_vocab_id_from_request(request, allow_fallback=False)
+    raw_vid = None
+    try:
+        if request.form:
+            raw_vid = request.form.get('vocab_id')
+    except Exception:
+        raw_vid = None
+    # Log incoming fields for debugging
+    logger.info("Incoming compare request: vocab_id_raw=%r filename=%r", raw_vid, orig_name)
+
+    if not found:
+        # Fail-fast: unknown vocab_id
+        return jsonify({"success": False, "error": "unknown vocab_id", "vocab_id": (str(raw_vid) if raw_vid is not None else None)}), 400
+
     job_id = uuid.uuid4().hex
     # initial job payload (processing) written to server/jobs/<job_id>.json
-    payload = {"status": "processing", "created_at": time.time(), "original_filename": orig_name}
+    payload = {"status": "processing", "created_at": time.time(), "original_filename": orig_name, "vocab_id": resolved_vid, "asset": asset_path}
     helpers.save_job_result(job_id, payload)
 
     # simulate async work

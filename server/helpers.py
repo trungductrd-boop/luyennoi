@@ -4,6 +4,7 @@ import unicodedata
 import re
 import logging
 from pathlib import Path
+from typing import Tuple, Optional, Dict, Any
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -91,3 +92,142 @@ def load_job_result(job_id: str):
     except Exception as e:
         logger.exception("Failed to load job result: %s", e)
         return None
+
+
+# --- audio id map helpers ---
+_AUDIO_ID_MAP: Optional[Dict[str, str]] = None
+_ASSET_TO_IDS: Optional[Dict[str, list]] = None
+
+
+def _audio_id_map_path() -> str:
+    # data/samples/audio_id_map.json relative to repository root
+    return str(Path(__file__).resolve().parent.parent / "data" / "samples" / "audio_id_map.json")
+
+
+def load_audio_id_map() -> Dict[str, str]:
+    """Load and cache the audio id -> asset path mapping."""
+    global _AUDIO_ID_MAP, _ASSET_TO_IDS
+    if _AUDIO_ID_MAP is not None:
+        return _AUDIO_ID_MAP
+    path = _audio_id_map_path()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            _AUDIO_ID_MAP = json.load(f)
+    except Exception:
+        logger.exception("Failed to load audio_id_map from %s", path)
+        _AUDIO_ID_MAP = {}
+
+    # build reverse map asset -> [ids]
+    _ASSET_TO_IDS = {}
+    for k, v in _AUDIO_ID_MAP.items():
+        _ASSET_TO_IDS.setdefault(v, []).append(k)
+    return _AUDIO_ID_MAP
+
+
+def get_canonical_id_for_asset(asset_path: str) -> Optional[str]:
+    """Return a deterministic canonical id for a given asset path.
+
+    If multiple ids map to the same asset, picks the lexicographically smallest id.
+    """
+    global _ASSET_TO_IDS
+    if _ASSET_TO_IDS is None:
+        load_audio_id_map()
+    ids = _ASSET_TO_IDS.get(asset_path)
+    if not ids:
+        return None
+    return sorted(ids)[0]
+
+
+def resolve_vocab_id_from_request(req, allow_fallback: bool = True) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
+    """Resolve `vocab_id` coming from a Flask `request`.
+
+    Returns tuple (found, vocab_id, asset_path, error_message).
+    - Accepts `vocab_id` from form, JSON body, or query string.
+    - Converts numeric values to strings.
+    - If vocab_id not found in map, will attempt fallback by `word` (basename of asset) when `allow_fallback`.
+    - Logs lookup steps.
+    """
+    raw_vid = None
+    # try form > json body > query
+    try:
+        if hasattr(req, "form") and req.form:
+            raw_vid = req.form.get("vocab_id")
+        if raw_vid is None:
+            # attempt JSON
+            try:
+                jb = req.get_json(silent=True)
+            except Exception:
+                jb = None
+            if jb and isinstance(jb, dict):
+                raw_vid = jb.get("vocab_id")
+        if raw_vid is None:
+            raw_vid = req.args.get("vocab_id")
+    except Exception:
+        raw_vid = None
+
+    # normalize to str when present
+    if raw_vid is not None:
+        try:
+            vid = str(raw_vid)
+        except Exception:
+            vid = None
+    else:
+        vid = None
+
+    audio_map = load_audio_id_map()
+    logger.info("Incoming vocab lookup: raw=%r form=%r args=%r json_vocab=%r", raw_vid, getattr(req, 'form', None), getattr(req, 'args', None), (req.get_json(silent=True) if hasattr(req, 'get_json') else None))
+
+    if vid:
+        asset = audio_map.get(vid)
+        if asset:
+            # found by id
+            logger.info("vocab_id resolved: %s -> %s", vid, asset)
+            # return canonical id in case of duplicates
+            canonical = get_canonical_id_for_asset(asset) or vid
+            return True, canonical, asset, None
+        else:
+            logger.warning("vocab_id %s not found in audio map", vid)
+
+    # fallback by word/basename
+    if allow_fallback:
+        # try form fields commonly used
+        word = None
+        try:
+            if hasattr(req, 'form') and req.form:
+                word = req.form.get('word') or req.form.get('basename')
+        except Exception:
+            word = None
+        if not word:
+            # if file uploaded, use filename
+            try:
+                f = getattr(req, 'files', None)
+                if f:
+                    ff = f.get('file')
+                    if ff and getattr(ff, 'filename', None):
+                        word = Path(ff.filename).stem
+            except Exception:
+                pass
+        if not word:
+            # try JSON 'word'
+            try:
+                jb = req.get_json(silent=True)
+                if jb and isinstance(jb, dict):
+                    word = jb.get('word')
+            except Exception:
+                pass
+
+        if word:
+            # canonicalize: look for asset paths that end with the basename
+            cand = None
+            for asset_path in (list(audio_map.values()) if audio_map else []):
+                if Path(asset_path).stem == str(word):
+                    cand = asset_path
+                    break
+            if cand:
+                cid = get_canonical_id_for_asset(cand)
+                logger.info("Fallback by word: %s -> %s (id=%s)", word, cand, cid)
+                return True, cid, cand, None
+        logger.warning("Fallback by word failed for word=%r", word)
+
+    # not found
+    return False, vid, None, "unknown vocab_id"
