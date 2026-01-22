@@ -709,7 +709,10 @@ async def api_analyze_compare(
 	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
 	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
 	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)"),
-	mouth_samples: Optional[str] = Form(None, description="Optional JSON array of mouth snapshots for multimodal fusion")
+	mouth_samples: Optional[str] = Form(None, description="Optional JSON array of mouth snapshots for multimodal fusion"),
+	type: Optional[str] = Form(None),
+	mode: Optional[str] = Form(None),
+	vocab_id: Optional[str] = Form(None),
 ):
 	"""
 	Upload user audio and compare with a reference sample.
@@ -724,19 +727,23 @@ async def api_analyze_compare(
 	try:
 		if not upload:
 			return _default_compare_response("No user audio provided")
-		user_contents = await upload.read()
-		if len(user_contents) == 0:
-			return _default_compare_response("Empty user file")
-		if hasattr(helpers, "MAX_UPLOAD_BYTES") and len(user_contents) > helpers.MAX_UPLOAD_BYTES:
-			return _default_compare_response("File too large")
 
+		# Validate type/mode/vocab mapping
+		if type and type != "audio":
+			return _default_compare_response("type must be 'audio'")
+		if mode == "vocab" and not vocab_id:
+			return JSONResponse(status_code=400, content={"error": "vocab_id required for mode=vocab"})
+		if vocab_id and vocab_id not in AUDIO_ID_MAP:
+			return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found"})
+
+		# Stream save to temp to avoid reading whole file into memory
 		os.makedirs(helpers.TMP_DIR, exist_ok=True)
 		created_tmp = True
+		try:
+			user_raw_path, total = save_upload_streaming(upload, helpers.TMP_DIR, getattr(helpers, "MAX_UPLOAD_BYTES", DEFAULT_UPLOAD_LIMIT))
+		except ValueError:
+			return _default_compare_response("File too large")
 		user_id = str(uuid.uuid4())[:8]
-		_, ext = os.path.splitext(upload.filename or "user.wav")
-		user_raw_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}{ext or '.wav'}")
-		with open(user_raw_path, "wb") as f:
-			f.write(user_contents)
 		user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
 		# If WAV and already 16k mono, skip conversion
 		try:
@@ -911,22 +918,24 @@ async def api_analyze(
 				return _default_compare_response("No user audio provided and no default sample available")
 			user_wav_path = default_path
 		else:
-			user_contents = await upload.read()
-			if len(user_contents) == 0:
+			# Stream-save upload to disk to avoid large memory usage
+			try:
+				os.makedirs(helpers.TMP_DIR, exist_ok=True)
+				created_tmp = True
+				user_raw_path, total = save_upload_streaming(upload, helpers.TMP_DIR, getattr(helpers, "MAX_UPLOAD_BYTES", DEFAULT_UPLOAD_LIMIT))
+			except ValueError:
+				return _default_compare_response("File too large")
+			except Exception:
+				return _default_compare_response("Failed to store upload")
+
+			# If empty upload, fallback to default sample
+			if total == 0:
 				default_path = _get_default_sample_path()
 				if not default_path:
 					return _default_compare_response("Empty user file and no default sample available")
 				user_wav_path = default_path
-			elif hasattr(helpers, "MAX_UPLOAD_BYTES") and len(user_contents) > helpers.MAX_UPLOAD_BYTES:
-				return _default_compare_response("File too large")
 			else:
-				os.makedirs(helpers.TMP_DIR, exist_ok=True)
-				created_tmp = True
 				user_id = str(uuid.uuid4())[:8]
-				_, ext = os.path.splitext(upload.filename or "user.wav")
-				user_raw_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}{ext or '.wav'}")
-				with open(user_raw_path, "wb") as f:
-					f.write(user_contents)
 				user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
 				# If WAV and already 16k mono, skip conversion
 				try:
@@ -1204,7 +1213,10 @@ async def api_analyze_auto(
 	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
 	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
 	lesson_id: Optional[str] = Form(None, description="Optional: filter by lesson ID"),
-	mouth_samples: Optional[str] = Form(None, description="Optional JSON array of mouth snapshots for multimodal fusion")
+	mouth_samples: Optional[str] = Form(None, description="Optional JSON array of mouth snapshots for multimodal fusion"),
+	type: Optional[str] = Form(None),
+	mode: Optional[str] = Form(None),
+	vocab_id: Optional[str] = Form(None),
 ):
 	"""
 	Upload audio and automatically detect which word the user is pronouncing.
@@ -1221,22 +1233,23 @@ async def api_analyze_auto(
 				return _default_auto_response("No user audio provided and no default sample available")
 			user_wav_path = default_path
 		else:
-			user_contents = await upload.read()
-			if len(user_contents) == 0:
+			# Stream-save upload
+			try:
+				os.makedirs(helpers.TMP_DIR, exist_ok=True)
+				created_tmp = True
+				user_raw_path, total = save_upload_streaming(upload, helpers.TMP_DIR, getattr(helpers, "MAX_UPLOAD_BYTES", DEFAULT_UPLOAD_LIMIT))
+			except ValueError:
+				return _default_auto_response("File too large")
+			except Exception:
+				return _default_auto_response("Failed to store upload")
+
+			if total == 0:
 				default_path = _get_default_sample_path()
 				if not default_path:
 					return _default_auto_response("Empty user file and no default sample available")
 				user_wav_path = default_path
-			elif len(user_contents) > helpers.MAX_UPLOAD_BYTES:
-				return _default_auto_response("File too large")
 			else:
-				os.makedirs(helpers.TMP_DIR, exist_ok=True)
-				created_tmp = True
 				user_id = str(uuid.uuid4())[:8]
-				_, ext = os.path.splitext(upload.filename or "audio.wav")
-				user_raw_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}{ext or '.wav'}")
-				with open(user_raw_path, "wb") as f:
-					f.write(user_contents)
 				user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
 				# If WAV and already 16k mono, skip conversion
 				try:

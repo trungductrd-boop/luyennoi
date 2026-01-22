@@ -9,7 +9,7 @@ import time
 from typing import Optional, Dict, Any
 from pathlib import Path
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Response, BackgroundTasks, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from size_limit_middleware import MaxBodySizeMiddleware
@@ -36,6 +36,8 @@ from audio_api import router as audio_router
 from audio_api import warm_sample_cache_background
 # reuse optimized helpers from audio_api for cached extraction & parallel compare
 from audio_api import _extract_features_with_timeout, _build_match_entry, _get_cached_features
+# helpers used for streaming saves and vocab mapping
+from audio_api import save_upload_streaming, AUDIO_ID_MAP, DEFAULT_UPLOAD_LIMIT
 
 # --- FastAPI app setup ---
 app = FastAPI(
@@ -279,39 +281,60 @@ def api_compare_features(sample: dict, user: dict):
 
 
 @app.post("/compare", summary="Compare user audio with sample (upload sample file or provide sample_id)")
-async def api_compare(user: Optional[UploadFile] = File(None), file: Optional[UploadFile] = File(None), sample: Optional[UploadFile] = File(None), sample_id: Optional[str] = Form(None), background_tasks: BackgroundTasks = None, wait: Optional[bool] = Form(False)): # pyright: ignore[reportUndefinedVariable]
+async def api_compare(
+    user: Optional[UploadFile] = File(None),
+    file: Optional[UploadFile] = File(None),
+    sample: Optional[UploadFile] = File(None),
+    sample_id: Optional[str] = Form(None),
+    type: Optional[str] = Form(None),
+    mode: Optional[str] = Form(None),
+    vocab_id: Optional[str] = Form(None),
+    word: Optional[str] = Form(None),
+    background_tasks: BackgroundTasks = None,
+    wait: Optional[bool] = Form(False),
+):
     # Accept upload under either `user` or `file` field (client may send `file`)
     upload = user or file
     if not upload:
         raise HTTPException(status_code=400, detail="No user file provided")
 
-    user_bytes = await upload.read()
-    if len(user_bytes) == 0:
-        raise HTTPException(status_code=400, detail="Empty user file")
-    if len(user_bytes) > helpers.MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="User file too large")
+    # Validate fields
+    if type and type != "audio":
+        raise HTTPException(status_code=400, detail="type must be 'audio'")
+    if mode == "vocab" and not vocab_id:
+        return JSONResponse(status_code=400, content={"error": "vocab_id required for mode=vocab"})
+    if vocab_id and vocab_id not in AUDIO_ID_MAP:
+        return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found"})
 
-    user_name = safe_filename(upload.filename)
-    user_ext = os.path.splitext(user_name)[1] or ".wav"
-    user_temp_path = os.path.join(helpers.USERS_DIR, f"u_{uuid.uuid4().hex}{user_ext}")
-    with open(user_temp_path, "wb") as f:
-        f.write(user_bytes)
+    # Stream-save user upload to avoid loading into RAM
+    try:
+        os.makedirs(helpers.USERS_DIR, exist_ok=True)
+        user_temp_path, _ = save_upload_streaming(upload, helpers.USERS_DIR, getattr(helpers, "MAX_UPLOAD_BYTES", DEFAULT_UPLOAD_LIMIT))
+    except ValueError:
+        raise HTTPException(status_code=413, detail="User file too large")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to store upload: {e}")
 
     sample_path = None
     sample_uploaded_temp = False
     if sample is not None:
-        sample_bytes = await sample.read()
-        if len(sample_bytes) > helpers.MAX_UPLOAD_BYTES:
+        try:
+            os.makedirs(helpers.SAMPLES_DIR, exist_ok=True)
+            sample_temp_path, _ = save_upload_streaming(sample, helpers.SAMPLES_DIR, getattr(helpers, "MAX_UPLOAD_BYTES", DEFAULT_UPLOAD_LIMIT))
+            sample_path = sample_temp_path
+            sample_uploaded_temp = True
+        except ValueError:
             try:
                 os.remove(user_temp_path)
             except Exception:
                 pass
             raise HTTPException(status_code=413, detail="Sample file too large")
-        sample_name = safe_filename(sample.filename)
-        sample_ext = os.path.splitext(sample_name)[1] or ".wav"
-        sample_temp_path = os.path.join(helpers.SAMPLES_DIR, f"s_{uuid.uuid4().hex}{sample_ext}")
-        with open(sample_temp_path, "wb") as f:
-            f.write(sample_bytes)
+        except Exception as e:
+            try:
+                os.remove(user_temp_path)
+            except Exception:
+                pass
+            raise HTTPException(status_code=500, detail=f"Failed to store sample upload: {e}")
         sample_path = sample_temp_path
         sample_uploaded_temp = True
     elif sample_id:
