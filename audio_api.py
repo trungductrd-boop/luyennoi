@@ -1373,9 +1373,33 @@ def resolve_vocab_sample(vocab_id: Optional[str], request_id: Optional[str] = No
 					if cand_norm and (cand_norm == norm_target or cand_norm.endswith(norm_target) or norm_target.endswith(cand_norm)):
 						found = os.path.join(helpers.SAMPLES_DIR, fn)
 						if os.path.exists(found):
+							try:
+								helpers.logger.info("resolve_vocab_sample: relaxed match for vocab_id=%s -> %s", vocab_id, found)
+							except Exception:
+								pass
 							return sample_id, found
 				except Exception:
 					continue
+		except Exception:
+			pass
+		# If still not found on disk, try matching against persisted store filenames (if available)
+		try:
+			helpers.load_persisted_store()
+			for sid, meta in helpers.PERSISTED_STORE.get("samples", {}).items():
+				fn = meta.get("filename")
+				if not fn:
+					continue
+				cand_norm = _normalize(os.path.splitext(fn)[0])
+				if cand_norm and (cand_norm == norm_target or cand_norm.endswith(norm_target) or norm_target.endswith(cand_norm)):
+					p = os.path.join(helpers.SAMPLES_DIR, fn)
+					if os.path.exists(p):
+						try:
+							helpers.logger.info("resolve_vocab_sample: matched persisted sample for vocab_id=%s -> %s (sample_id=%s)", vocab_id, p, sid)
+						except Exception:
+							pass
+						return sid, p
+		except Exception:
+			pass
 		except Exception:
 			pass
 

@@ -477,6 +477,28 @@ def _timestamp_to_str(timestamp: float) -> str:
     """Convert Unix timestamp to ISO string"""
     return datetime.fromtimestamp(timestamp).isoformat()
 
+
+def normalize_match_key(name: Optional[str]) -> str:
+    """Normalize a filename or base name for loose matching.
+
+    Produces a lowercase alphanumeric-only key (no spaces, punctuation, diacritics).
+    Used to prefer exact filename matches across slightly different naming conventions.
+    """
+    if not name:
+        return ""
+    try:
+        base = os.path.basename(name)
+        base_no_ext = os.path.splitext(base)[0]
+        nk = unicodedata.normalize('NFKD', base_no_ext)
+        no_diac = ''.join(c for c in nk if not unicodedata.combining(c))
+        key = re.sub(r'[^A-Za-z0-9]+', '', no_diac).lower()
+        return key
+    except Exception:
+        try:
+            return re.sub(r'[^A-Za-z0-9]+', '', str(name)).lower()
+        except Exception:
+            return ""
+
 # Multimodal helpers are provided in a separate module helpers_multimodal.py.
 # Attempt relative import first, fall back to top-level import, else set to None.
 try:

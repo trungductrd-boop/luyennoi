@@ -1061,14 +1061,26 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
 
             # Attempt direct match by filename/sample id from upload name
             user_base = os.path.splitext(os.path.basename(user_temp_path))[0]
+            user_key = helpers.normalize_match_key(user_base)
             direct_sid = None
+            # Prefer explicit sample_id equal to upload base name
             if user_base in samples_meta:
                 direct_sid = user_base
             else:
+                # Try normalized filename match first, then exact filename
                 for sid, meta in samples_meta.items():
-                    if meta.get("filename") == os.path.basename(user_temp_path):
+                    fn = meta.get("filename")
+                    if not fn:
+                        continue
+                    sample_key = helpers.normalize_match_key(fn)
+                    if sample_key and user_key and sample_key == user_key:
                         direct_sid = sid
                         break
+                if not direct_sid:
+                    for sid, meta in samples_meta.items():
+                        if meta.get("filename") == os.path.basename(user_temp_path):
+                            direct_sid = sid
+                            break
 
             if direct_sid:
                 sample_meta = samples_meta.get(direct_sid)
@@ -1085,7 +1097,19 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
 
                 f1 = _get_cached_features(sample_path) or _extract_features_with_timeout(sample_path, timeout=30)
                 mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(f1, f2)
-
+                # If mfcc distance is very large we likely matched incorrectly; guard by threshold
+                try:
+                    threshold = float(os.environ.get("MATCH_MFCC_THRESHOLD", "100"))
+                except Exception:
+                    threshold = 100.0
+                if mfcc_dist is not None and mfcc_dist > threshold:
+                    _save_job_result(job_id, {"status": "error", "error": "no_matching_sample_found"})
+                    saved = True
+                    try:
+                        os.remove(user_temp_path)
+                    except Exception:
+                        pass
+                    return
                 if mfcc_dist < 40:
                     feedback = "Rất giống! Bạn phát âm tốt."
                 elif mfcc_dist < 80:
@@ -1203,6 +1227,15 @@ def process_compare_job(sample_path: Optional[str], user_temp_path: str, sample_
                 "features_sample": best_features,
                 "features_user": f2,
             }
+            # Guard: reject very poor matches to avoid returning wrong sample
+            try:
+                threshold = float(os.environ.get("MATCH_MFCC_THRESHOLD", "100"))
+            except Exception:
+                threshold = 100.0
+            if mfcc_dist is not None and mfcc_dist > threshold:
+                _save_job_result(job_id, {"status": "error", "error": "no_matching_sample_found"})
+                saved = True
+                return
             payload = {"status": "done", "result": resp}
             _save_job_result(job_id, payload)
             try:
