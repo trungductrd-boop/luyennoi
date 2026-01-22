@@ -71,6 +71,32 @@ app = FastAPI(
     version="1.0.0"
 )
 
+
+# Middleware: log raw request body for POST/PUT/PATCH to help debug client payloads
+@app.middleware("http")
+async def log_raw_request_body(request: Request, call_next):
+    try:
+        # Only log for methods that typically have bodies
+        if request.method in ("POST", "PUT", "PATCH"):
+            body_bytes = await request.body()
+            try:
+                body_text = body_bytes.decode('utf-8', errors='replace')
+            except Exception:
+                body_text = str(body_bytes)
+            try:
+                helpers.logger.info("RAW REQUEST %s %s: %s", request.method, request.url.path, body_text)
+            except Exception:
+                pass
+            # Preserve raw body for downstream handlers
+            request._body = body_bytes
+            request.state.raw_body = body_text
+    except Exception:
+        try:
+            helpers.logger.exception("Failed to log raw request body")
+        except Exception:
+            pass
+    return await call_next(request)
+
 # Register lightweight sample metadata endpoint after `app` exists to avoid
 # referencing `app` at import time (prevents NameError when module is imported).
 app.get("/sample/{sample_id}", summary="Fetch sample metadata by id (lazy)")(api_get_sample)
@@ -346,7 +372,10 @@ async def api_compare(
         # Quick defensive cast: ensure vocab_id is string to match JSON keys
         try:
             if vocab_id is not None:
-                vocab_id = str(vocab_id)
+                # Print raw received vocab_id and type for debugging
+                helpers.logger.info("vocab_id raw (before strip): %r %s", vocab_id, type(vocab_id))
+                vocab_id = str(vocab_id).strip()
+                helpers.logger.info("vocab_id normalized (after strip): %r", vocab_id)
         except Exception:
             pass
 
@@ -359,14 +388,14 @@ async def api_compare(
 
         helpers.logger.info("===== DEBUG =====")
         helpers.logger.info("Received vocab_id: %s %s", vocab_id, type(vocab_id))
-        # Build a lightweight VOCAB_INDEX for quick debug (keys forced to str)
+        # Build a lightweight VOCAB_INDEX for quick debug (normalize keys by stripping)
         VOCAB_INDEX = {}
         try:
             for lid, items in helpers.VOCAB.items():
                 for v in items:
                     vid = v.get("id")
                     if vid is not None:
-                        VOCAB_INDEX[str(vid)] = v
+                        VOCAB_INDEX[str(vid).strip()] = v
         except Exception:
             pass
         try:
@@ -375,10 +404,10 @@ async def api_compare(
                 for v in items:
                     vid = v.get("id")
                     if vid is not None:
-                        VOCAB_INDEX[str(vid)] = v
+                        VOCAB_INDEX[str(vid).strip()] = v
         except Exception:
             pass
-        helpers.logger.info("VOCAB_INDEX keys sample: %s", list(VOCAB_INDEX.keys())[:10])
+        helpers.logger.info("VOCAB_INDEX keys sample: %s", list(VOCAB_INDEX.keys())[:20])
         helpers.logger.info("VOCAB_INDEX size: %d", len(VOCAB_INDEX))
         # Check existence
         if vocab_id is not None and vocab_id not in VOCAB_INDEX:
