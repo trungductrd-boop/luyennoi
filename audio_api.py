@@ -305,6 +305,101 @@ def _enqueue_processing(task_id: str, src_path: str, original_filename: str, met
 	executor.submit(job)
 
 
+def _background_compare_job(task_id: str, tmp_wav_path: str, original_filename: str, sample_id: Optional[str], mouth_samples: Optional[str]):
+	"""Background worker to run compare logic and store result into UPLOAD_TASKS[task_id]["result"]."""
+	try:
+		helpers.logger.info("Background compare job %s starting (file=%s, sample_id=%s)", task_id, original_filename, sample_id)
+		# Load persisted store and validate sample
+		helpers.load_persisted_store()
+		if not sample_id:
+			UPLOAD_TASKS[task_id]["status"] = "error"
+			UPLOAD_TASKS[task_id]["error"] = "No sample_id provided for compare"
+			return
+
+		sample_meta = helpers.PERSISTED_STORE.get("samples", {}).get(sample_id)
+		if not sample_meta:
+			UPLOAD_TASKS[task_id]["status"] = "error"
+			UPLOAD_TASKS[task_id]["error"] = f"Reference sample '{sample_id}' not found"
+			return
+
+		ref_filename = sample_meta.get("filename")
+		ref_path = os.path.join(helpers.SAMPLES_DIR, ref_filename)
+		if not os.path.exists(ref_path):
+			UPLOAD_TASKS[task_id]["status"] = "error"
+			UPLOAD_TASKS[task_id]["error"] = f"Reference audio file not found: {ref_filename}"
+			return
+
+		# Extract features (use timeout wrapper)
+		try:
+			user_features = _extract_features_with_timeout(tmp_wav_path, timeout=30)
+			ref_features = _extract_features_with_timeout(ref_path, timeout=30)
+		except Exception as e:
+			UPLOAD_TASKS[task_id]["status"] = "error"
+			UPLOAD_TASKS[task_id]["error"] = f"Feature extraction failed: {e}"
+			return
+
+		if not user_features or not ref_features:
+			UPLOAD_TASKS[task_id]["status"] = "error"
+			UPLOAD_TASKS[task_id]["error"] = "Feature extraction produced no usable features"
+			return
+
+		try:
+			mfcc_dist, pitch_diff, tempo_diff = helpers.compare_features_dicts(user_features, ref_features)
+		except Exception as e:
+			UPLOAD_TASKS[task_id]["status"] = "error"
+			UPLOAD_TASKS[task_id]["error"] = f"Comparison failed: {e}"
+			return
+
+		mfcc_score = max(0, 100 - mfcc_dist * 2)
+		pitch_score = max(0, 100 - pitch_diff * 0.5)
+		tempo_score = max(0, 100 - tempo_diff * 0.5)
+		overall_score = (mfcc_score * 0.6 + pitch_score * 0.3 + tempo_score * 0.1)
+
+		vocab_info = _get_vocab_info(sample_id, sample_meta)
+		recognized = vocab_info.get("word") or ""
+
+		score_norm = round(max(0.0, min(1.0, overall_score / 100.0)), 4)
+		confidence = round(min(1.0, score_norm + 0.08), 4)
+
+		hand_sign = sample_meta.get("hand_sign") or (recognized.replace(' ', '_').lower() + ".png" if recognized else None)
+		mouth_shape = sample_meta.get("mouth_shape") or ("open" if overall_score >= 60 else "closed")
+
+		if overall_score >= 80:
+			visual_level = "good"
+			color_hint = "green"
+		elif overall_score >= 60:
+			visual_level = "fair"
+			color_hint = "yellow"
+		else:
+			visual_level = "poor"
+			color_hint = "red"
+
+		advice = _get_feedback(overall_score)
+
+		result = {
+			"job_id": task_id,
+			"status": "done",
+			"recognized_text": recognized,
+			"score": score_norm,
+			"confidence": confidence,
+			"advice": advice,
+			"hand_sign": hand_sign,
+			"mouth_shape": mouth_shape,
+			"visual_level": visual_level,
+			"color_hint": color_hint,
+		}
+
+		UPLOAD_TASKS[task_id]["status"] = "done"
+		UPLOAD_TASKS[task_id]["result"] = result
+		helpers.logger.info("Background compare job %s finished", task_id)
+	finally:
+		try:
+			if os.path.exists(tmp_wav_path):
+				os.remove(tmp_wav_path)
+		except Exception:
+			pass
+
+
 # -------------------------
 # Upload endpoint
 # -------------------------
@@ -706,20 +801,27 @@ def api_get_vocab_store(lesson_id: str):
 # -------------------------
 @router.post("/analyze/compare", summary="Compare user audio with reference sample")
 async def api_analyze_compare(
+	request: Request,
 	user_audio: Optional[UploadFile] = File(None, description="User's pronunciation audio"),
 	file: Optional[UploadFile] = File(None, description="Alternative field name 'file'"),
+	sample: Optional[UploadFile] = File(None, description="Alternative field name 'sample'"),
+	user: Optional[UploadFile] = File(None, description="Alternative field name 'user'"),
 	sample_id: Optional[str] = Form(None, description="Reference sample ID to compare against (optional)"),
 	mouth_samples: Optional[str] = Form(None, description="Optional JSON array of mouth snapshots for multimodal fusion"),
 	type: Optional[str] = Form(None),
 	mode: Optional[str] = Form(None),
 	vocab_id: Optional[str] = Form(None),
+	background: Optional[str] = Form(None, description="If 'true' or '1', run compare in background and return job_id"),
 ):
 	"""
 	Upload user audio and compare with a reference sample.
 	Returns similarity scores for pronunciation accuracy.
 	"""
-	# Accept either 'user_audio' or 'file'
-	upload = user_audio or file
+	# Accept common client field names: user_audio, file, sample, user
+	upload = user_audio or file or sample or user
+	bg = False
+	if background is not None and str(background).lower() in ("1", "true", "yes"):
+		bg = True
 
 	# Prepare user audio
 	user_wav_path = None
@@ -743,9 +845,13 @@ async def api_analyze_compare(
 			user_raw_path, total = save_upload_streaming(upload, helpers.TMP_DIR, getattr(helpers, "MAX_UPLOAD_BYTES", DEFAULT_UPLOAD_LIMIT))
 		except ValueError:
 			return _default_compare_response("File too large")
+		except Exception:
+			return _default_compare_response("Failed to store upload")
+
 		user_id = str(uuid.uuid4())[:8]
 		user_wav_path = os.path.join(helpers.TMP_DIR, f"user_{user_id}.wav")
-		# If WAV and already 16k mono, skip conversion
+
+		# If background requested: perform conversion now and enqueue job
 		try:
 			skip_conv = False
 			if user_raw_path.lower().endswith('.wav'):
@@ -757,10 +863,11 @@ async def api_analyze_compare(
 					skip_conv = False
 
 			if skip_conv:
-				user_wav_path = user_raw_path
+				tmp_wav_path = user_raw_path
 			else:
 				helpers.convert_to_wav16_mono(user_raw_path, user_wav_path)
-				if user_raw_path != user_wav_path:
+				tmp_wav_path = user_wav_path
+				if user_raw_path != tmp_wav_path:
 					try:
 						os.remove(user_raw_path)
 					except Exception:
@@ -773,7 +880,19 @@ async def api_analyze_compare(
 				pass
 			return _default_compare_response("Audio conversion failed")
 
-		# sample_id must be provided for explicit compare
+		# If background requested, enqueue and return job id
+		if bg:
+			task_id = str(uuid.uuid4())[:8]
+			UPLOAD_TASKS[task_id] = {
+				"status": "processing",
+				"original_filename": upload.filename,
+				"submitted_at": time.time(),
+			}
+			# Submit background worker
+			executor.submit(_background_compare_job, task_id, tmp_wav_path, upload.filename, sample_id, mouth_samples)
+			return JSONResponse(status_code=202, content={"job_id": task_id, "status": "processing"})
+
+		# sample_id must be provided for explicit compare (sync path)
 		if not sample_id:
 			try:
 				if created_tmp and user_wav_path and os.path.exists(user_wav_path):

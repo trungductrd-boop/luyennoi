@@ -282,6 +282,7 @@ def api_compare_features(sample: dict, user: dict):
 
 @app.post("/compare", summary="Compare user audio with sample (upload sample file or provide sample_id)")
 async def api_compare(
+    request: Request,
     user: Optional[UploadFile] = File(None),
     file: Optional[UploadFile] = File(None),
     sample: Optional[UploadFile] = File(None),
@@ -295,6 +296,19 @@ async def api_compare(
 ):
     # Accept upload under either `user` or `file` field (client may send `file`)
     upload = user or file
+
+    # Log minimal request info to help diagnose 400s (do not log file contents)
+    try:
+        client = None
+        if hasattr(request, 'client') and request.client:
+            client = f"{request.client.host}:{request.client.port}"
+        helpers.logger.info("/compare request from %s headers=%s filename=%s sample_present=%s sample_id=%s type=%s mode=%s vocab_id=%s",
+                            client, dict(request.headers), getattr(upload, 'filename', None), bool(sample), sample_id, type, mode, vocab_id)
+    except Exception:
+        try:
+            helpers.logger.warning("Failed to log /compare request details")
+        except Exception:
+            pass
     if not upload:
         raise HTTPException(status_code=400, detail="No user file provided")
 
