@@ -297,33 +297,88 @@ async def api_compare(
     # Accept upload under either `user` or `file` field (client may send `file`)
     upload = user or file
 
+    # Generate a short request id for logging and error correlation
+    request_id = uuid.uuid4().hex[:8]
+
     # Log minimal request info to help diagnose 400s (do not log file contents)
     try:
         client = None
         if hasattr(request, 'client') and request.client:
             client = f"{request.client.host}:{request.client.port}"
-        helpers.logger.info("/compare request from %s headers=%s filename=%s sample_present=%s sample_id=%s type=%s mode=%s vocab_id=%s",
-                            client, dict(request.headers), getattr(upload, 'filename', None), bool(sample), sample_id, type, mode, vocab_id)
+        helpers.logger.info("/compare request_id=%s from %s headers=%s filename=%s sample_present=%s sample_id=%s type=%s mode=%s vocab_id=%s",
+                            request_id, client, dict(request.headers), getattr(upload, 'filename', None), bool(sample), sample_id, type, mode, vocab_id)
     except Exception:
         try:
-            helpers.logger.warning("Failed to log /compare request details")
+            helpers.logger.warning("Failed to log /compare request details (request_id=%s)", request_id)
         except Exception:
             pass
     if not upload:
-        raise HTTPException(status_code=400, detail="No user file provided")
+        # Keep responses JSON-shaped for client compatibility
+        return JSONResponse(status_code=400, content={"error": "no_user_file", "detail": "No user file provided", "request_id": request_id})
 
     # Validate fields
     if type and type != "audio":
-        raise HTTPException(status_code=400, detail="type must be 'audio'")
+        return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "type must be 'audio'", "request_id": request_id})
     if mode == "vocab" and not vocab_id:
-        return JSONResponse(status_code=400, content={"error": "vocab_id required for mode=vocab"})
-    # Be permissive: accept vocab_id even if not in AUDIO_ID_MAP.
-    # Some clients may send vocab identifiers that are not yet synced to the server.
-    if vocab_id and vocab_id not in AUDIO_ID_MAP:
+        return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id required for mode=vocab", "request_id": request_id})
+
+    # If mode=vocab, attempt to resolve vocab_id formats: 'w<N>' (1-based index)
+    # or direct sample id keys found in AUDIO_ID_MAP. Return clear JSON errors
+    # if resolution fails or the referenced sample file is missing.
+    resolved_sample_path = None
+    resolved_sample_id = None
+    if mode == "vocab":
+        # Ensure AUDIO_ID_MAP is present
         try:
-            helpers.logger.warning("Received unknown vocab_id=%s; proceeding permissively", vocab_id)
+            if not AUDIO_ID_MAP:
+                helpers.logger.warning("AUDIO_ID_MAP empty when resolving vocab (request_id=%s)", request_id)
         except Exception:
             pass
+
+        if vocab_id:
+            vid = str(vocab_id)
+            # wN form -> 1-based index into AUDIO_ID_MAP values
+            m = None
+            try:
+                if vid.lower().startswith('w') and vid[1:].isdigit():
+                    idx = int(vid[1:]) - 1
+                    items = list(AUDIO_ID_MAP.items())
+                    if idx < 0 or idx >= len(items):
+                        return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": f"vocab index out of range: {vid}", "request_id": request_id})
+                    resolved_sample_id, mapped = items[idx]
+                    m = mapped
+                else:
+                    # treat as direct sample id key
+                    if vid in AUDIO_ID_MAP:
+                        resolved_sample_id = vid
+                        m = AUDIO_ID_MAP.get(vid)
+                    else:
+                        # try matching by filename (basename)
+                        try:
+                            for k, v in AUDIO_ID_MAP.items():
+                                if os.path.basename(v) == vid or os.path.basename(v) == os.path.basename(vid):
+                                    resolved_sample_id = k
+                                    m = v
+                                    break
+                        except Exception:
+                            pass
+
+            except Exception as e:
+                helpers.logger.warning("Error resolving vocab_id=%s (request_id=%s): %s", vocab_id, request_id, e)
+                return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "Failed to resolve vocab_id", "request_id": request_id})
+
+            if not m:
+                return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found in audio_id_map", "request_id": request_id})
+
+            # Map value may be a path like 'assets/samples/foo.wav' – normalize to samples dir
+            sample_basename = os.path.basename(m)
+            sample_full = os.path.join(helpers.SAMPLES_DIR, sample_basename)
+            if not os.path.exists(sample_full):
+                return JSONResponse(status_code=404, content={"error": "sample_missing", "detail": f"Reference audio file not found: {sample_basename}", "request_id": request_id})
+
+            resolved_sample_path = sample_full
+            # set sample_id for downstream logic if needed
+            sample_id = resolved_sample_id
 
     # Stream-save user upload to avoid loading into RAM
     try:
@@ -336,6 +391,9 @@ async def api_compare(
 
     sample_path = None
     sample_uploaded_temp = False
+    # If mode=vocab resolved a sample path earlier, prefer that
+    if resolved_sample_path:
+        sample_path = resolved_sample_path
     if sample is not None:
         try:
             os.makedirs(helpers.SAMPLES_DIR, exist_ok=True)
