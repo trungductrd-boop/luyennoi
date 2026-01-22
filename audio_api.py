@@ -1349,9 +1349,35 @@ def resolve_vocab_sample(vocab_id: Optional[str], request_id: Optional[str] = No
 			return None, None
 
 		sample_basename = os.path.basename(mapped)
+		sample_basename = os.path.basename(mapped)
+		# Primary candidate: expected file under helpers.SAMPLES_DIR
 		sample_full = os.path.join(helpers.SAMPLES_DIR, sample_basename)
-		if not os.path.exists(sample_full):
-			return None, None
+		if os.path.exists(sample_full):
+			return sample_id, sample_full
+		# If exact basename not found, attempt relaxed matching against files in SAMPLES_DIR
+		def _normalize(name: str) -> str:
+			# lowercase, remove non-alphanumeric characters for fuzzy match
+			import re
+			return re.sub(r"[^a-z0-9]", "", name.lower() if name else "")
+		try:
+			norm_target = _normalize(os.path.splitext(sample_basename)[0])
+		except Exception:
+			norm_target = _normalize(sample_basename)
+		# scan samples dir for a forgiving match
+		try:
+			for fn in os.listdir(helpers.SAMPLES_DIR):
+				try:
+					if not fn or not isinstance(fn, str):
+						continue
+					cand_norm = _normalize(os.path.splitext(fn)[0])
+					if cand_norm and (cand_norm == norm_target or cand_norm.endswith(norm_target) or norm_target.endswith(cand_norm)):
+						found = os.path.join(helpers.SAMPLES_DIR, fn)
+						if os.path.exists(found):
+							return sample_id, found
+				except Exception:
+					continue
+		except Exception:
+			pass
 
 		return sample_id, sample_full
 	except Exception:
