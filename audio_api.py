@@ -1304,6 +1304,60 @@ def _get_default_sample_path() -> Optional[str]:
 	return None
 
 
+def resolve_vocab_sample(vocab_id: Optional[str], request_id: Optional[str] = None, allow_permissive: bool = False):
+	"""Resolve a vocab_id to (sample_id, sample_path).
+
+	Supports:
+	- exact key lookup in AUDIO_ID_MAP
+	- 'w<N>' 1-based index into AUDIO_ID_MAP ordered items
+	- basename match against values in AUDIO_ID_MAP
+
+	Returns (sample_id, sample_fullpath) or (None, None) if not resolvable.
+	Does not raise; caller should construct HTTP/JSON responses.
+	"""
+	if not vocab_id:
+		return None, None
+
+	try:
+		vid = str(vocab_id)
+		# wN form -> 1-based index into AUDIO_ID_MAP values
+		if vid.lower().startswith('w') and vid[1:].isdigit():
+			idx = int(vid[1:]) - 1
+			items = list(AUDIO_ID_MAP.items())
+			if idx < 0 or idx >= len(items):
+				return None, None
+			sample_id, mapped = items[idx]
+		else:
+			# direct key
+			if vid in AUDIO_ID_MAP:
+				sample_id = vid
+				mapped = AUDIO_ID_MAP.get(vid)
+			else:
+				# try matching by basename
+				sample_id = None
+				mapped = None
+				for k, v in AUDIO_ID_MAP.items():
+					try:
+						if os.path.basename(v) == vid or os.path.basename(v) == os.path.basename(vid):
+							sample_id = k
+							mapped = v
+							break
+					except Exception:
+						continue
+
+		if not mapped:
+			return None, None
+
+		sample_basename = os.path.basename(mapped)
+		sample_full = os.path.join(helpers.SAMPLES_DIR, sample_basename)
+		if not os.path.exists(sample_full):
+			return None, None
+
+		return sample_id, sample_full
+	except Exception:
+		return None, None
+
+
 def _default_compare_response(message: str = "No analysis available") -> dict:
 	return {
 		"ok": False,

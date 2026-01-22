@@ -37,7 +37,7 @@ from audio_api import warm_sample_cache_background
 # reuse optimized helpers from audio_api for cached extraction & parallel compare
 from audio_api import _extract_features_with_timeout, _build_match_entry, _get_cached_features
 # helpers used for streaming saves and vocab mapping
-from audio_api import save_upload_streaming, AUDIO_ID_MAP, DEFAULT_UPLOAD_LIMIT
+from audio_api import save_upload_streaming, AUDIO_ID_MAP, DEFAULT_UPLOAD_LIMIT, resolve_vocab_sample
 
 # --- FastAPI app setup ---
 app = FastAPI(
@@ -322,63 +322,23 @@ async def api_compare(
     if mode == "vocab" and not vocab_id:
         return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id required for mode=vocab", "request_id": request_id})
 
-    # If mode=vocab, attempt to resolve vocab_id formats: 'w<N>' (1-based index)
-    # or direct sample id keys found in AUDIO_ID_MAP. Return clear JSON errors
-    # if resolution fails or the referenced sample file is missing.
+    # If mode=vocab, resolve vocabs centrally via resolve_vocab_sample.
     resolved_sample_path = None
     resolved_sample_id = None
     if mode == "vocab":
-        # Ensure AUDIO_ID_MAP is present
-        try:
-            if not AUDIO_ID_MAP:
-                helpers.logger.warning("AUDIO_ID_MAP empty when resolving vocab (request_id=%s)", request_id)
-        except Exception:
-            pass
-
-        if vocab_id:
-            vid = str(vocab_id)
-            # wN form -> 1-based index into AUDIO_ID_MAP values
-            m = None
-            try:
-                if vid.lower().startswith('w') and vid[1:].isdigit():
-                    idx = int(vid[1:]) - 1
-                    items = list(AUDIO_ID_MAP.items())
-                    if idx < 0 or idx >= len(items):
-                        return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": f"vocab index out of range: {vid}", "request_id": request_id})
-                    resolved_sample_id, mapped = items[idx]
-                    m = mapped
-                else:
-                    # treat as direct sample id key
-                    if vid in AUDIO_ID_MAP:
-                        resolved_sample_id = vid
-                        m = AUDIO_ID_MAP.get(vid)
-                    else:
-                        # try matching by filename (basename)
-                        try:
-                            for k, v in AUDIO_ID_MAP.items():
-                                if os.path.basename(v) == vid or os.path.basename(v) == os.path.basename(vid):
-                                    resolved_sample_id = k
-                                    m = v
-                                    break
-                        except Exception:
-                            pass
-
-            except Exception as e:
-                helpers.logger.warning("Error resolving vocab_id=%s (request_id=%s): %s", vocab_id, request_id, e)
-                return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "Failed to resolve vocab_id", "request_id": request_id})
-
-            if not m:
-                return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found in audio_id_map", "request_id": request_id})
-
-            # Map value may be a path like 'assets/samples/foo.wav' – normalize to samples dir
-            sample_basename = os.path.basename(m)
-            sample_full = os.path.join(helpers.SAMPLES_DIR, sample_basename)
-            if not os.path.exists(sample_full):
-                return JSONResponse(status_code=404, content={"error": "sample_missing", "detail": f"Reference audio file not found: {sample_basename}", "request_id": request_id})
-
-            resolved_sample_path = sample_full
-            # set sample_id for downstream logic if needed
-            sample_id = resolved_sample_id
+        allow_permissive = str(os.environ.get("ALLOW_PERMISSIVE_VOCAB", "0")) == "1"
+        sid, spath = resolve_vocab_sample(vocab_id, request_id=request_id)
+        if not sid or not spath:
+            if allow_permissive:
+                try:
+                    helpers.logger.warning("Unknown vocab_id=%s (request_id=%s); permissive fallback enabled", vocab_id, request_id)
+                except Exception:
+                    pass
+            else:
+                return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found or invalid", "request_id": request_id})
+        else:
+            resolved_sample_id = sid
+            resolved_sample_path = spath
 
     # Stream-save user upload to avoid loading into RAM
     try:
