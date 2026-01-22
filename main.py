@@ -317,8 +317,13 @@ async def api_compare(
         raise HTTPException(status_code=400, detail="type must be 'audio'")
     if mode == "vocab" and not vocab_id:
         return JSONResponse(status_code=400, content={"error": "vocab_id required for mode=vocab"})
+    # Be permissive: accept vocab_id even if not in AUDIO_ID_MAP.
+    # Some clients may send vocab identifiers that are not yet synced to the server.
     if vocab_id and vocab_id not in AUDIO_ID_MAP:
-        return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found"})
+        try:
+            helpers.logger.warning("Received unknown vocab_id=%s; proceeding permissively", vocab_id)
+        except Exception:
+            pass
 
     # Stream-save user upload to avoid loading into RAM
     try:
