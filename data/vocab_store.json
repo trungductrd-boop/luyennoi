@@ -5,13 +5,13 @@
         "word": "Xin chào",
         "meaning": "Hello",
         "example": "Xin chào bạn!",
-        "audio_filename": "xin_chao.mp3"
+        "audio_filename": "xin_chao.wav"
       }
     }
   },
   "samples": {
     "3f63a43a": {
-      "filename": "anhtrai.wav",
+      "filename": "anh_trai.wav",
       "lesson_id": null,
       "vocab_id": null
     },
@@ -21,7 +21,7 @@
       "vocab_id": null
     },
     "4271ec18": {
-      "filename": "bankhoekhong.wav",
+      "filename": "ban_khoe_khong.wav",
       "lesson_id": null,
       "vocab_id": null
     },
@@ -126,12 +126,12 @@
       "vocab_id": "1_100"
     },
     "e1414db3": {
-      "filename": "banhmi.wav",
+      "filename": "banh_mi.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "170c9a86": {
-      "filename": "bo.mp3",
+      "filename": "bo.wav",
       "lesson_id": null,
       "vocab_id": null
     },
@@ -141,12 +141,12 @@
       "vocab_id": null
     },
     "214bad09": {
-      "filename": "ca.mp3",
+      "filename": "ca.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "604783fe": {
-      "filename": "caphe.wav",
+      "filename": "ca_phe.wav",
       "lesson_id": null,
       "vocab_id": null
     },
@@ -231,252 +231,252 @@
       "vocab_id": null
     },
     "6025a640": {
-      "filename": "xanh_duong.mp3",
+      "filename": "xanh_duong.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "6e3118d6": {
-      "filename": "xanh_la.mp3",
+      "filename": "xanh_la.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "b0026a51": {
-      "filename": "anhtrai.mp3",
+      "filename": "anh_trai.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "81d0b725": {
-      "filename": "banhmi.mp3",
+      "filename": "banh_mi.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "6567f205": {
-      "filename": "bankhoekhong.mp3",
+      "filename": "ban_khoe_khong.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "daec192d": {
-      "filename": "ca.mp3",
+      "filename": "ca.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "084b5709": {
-      "filename": "cam.mp3",
+      "filename": "cam.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "9e9e3b73": {
-      "filename": "caphe.mp3",
+      "filename": "caphe.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "202a5795": {
-      "filename": "chim.mp3",
+      "filename": "chim.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "c988ac27": {
-      "filename": "cho.mp3",
+      "filename": "cho.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "fa4a8cdc": {
-      "filename": "den.mp3",
+      "filename": "den.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "3021bf7d": {
-      "filename": "do.mp3",
+      "filename": "do.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "03ec988b": {
-      "filename": "ga.mp3",
+      "filename": "ga.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "5e6eb2c7": {
-      "filename": "heo.mp3",
+      "filename": "heo.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "ae2066a8": {
-      "filename": "meo.mp3",
+      "filename": "meo.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "9c63d01b": {
-      "filename": "nuoc.mp3",
+      "filename": "nuoc.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "2b901073": {
-      "filename": "pho.mp3",
+      "filename": "pho.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "d40cb03c": {
-      "filename": "sua.mp3",
+      "filename": "sua.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "5321b9d5": {
-      "filename": "thit.mp3",
+      "filename": "thit.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "6ca47d05": {
-      "filename": "tim.mp3",
+      "filename": "tim.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "71f4769c": {
-      "filename": "tra.mp3",
+      "filename": "tra.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "cef1a765": {
-      "filename": "trang.mp3",
+      "filename": "trang.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "2d81fcde": {
-      "filename": "vang1.mp3",
+      "filename": "vang1.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "d0b4c8d8": {
-      "filename": "vang2.mp3",
+      "filename": "vang2.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "bd6aceee": {
-      "filename": "xanh_duong.mp3",
+      "filename": "xanh_duong.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "febecd22": {
-      "filename": "xanh_la.mp3",
+      "filename": "xanh_la.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "589a009c": {
-      "filename": "anhtrai.mp3",
+      "filename": "anh_trai.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "a446f134": {
-      "filename": "banhmi.mp3",
+      "filename": "banh_mi.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "5546c4de": {
-      "filename": "bankhoekhong.mp3",
+      "filename": "ban_khoe_khong.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "ac99a920": {
-      "filename": "ca.mp3",
+      "filename": "ca.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "7b3106e4": {
-      "filename": "cam.mp3",
+      "filename": "cam.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "da1e1ed1": {
-      "filename": "caphe.mp3",
+      "filename": "caphe.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "c412c613": {
-      "filename": "chim.mp3",
+      "filename": "chim.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "3a12f812": {
-      "filename": "cho.mp3",
+      "filename": "cho.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "4a69c6c7": {
-      "filename": "den.mp3",
+      "filename": "den.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "3168cc31": {
-      "filename": "do.mp3",
+      "filename": "do.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "45e14f7f": {
-      "filename": "ga.mp3",
+      "filename": "ga.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "82d1612f": {
-      "filename": "heo.mp3",
+      "filename": "heo.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "eddbf9a6": {
-      "filename": "meo.mp3",
+      "filename": "meo.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "da72a002": {
-      "filename": "nuoc.mp3",
+      "filename": "nuoc.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "548055bd": {
-      "filename": "pho.mp3",
+      "filename": "pho.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "fc8cc999": {
-      "filename": "sua.mp3",
+      "filename": "sua.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "c8cc2af9": {
-      "filename": "thit.mp3",
+      "filename": "thit.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "459191c7": {
-      "filename": "tim.mp3",
+      "filename": "tim.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "a06f68a3": {
-      "filename": "tra.mp3",
+      "filename": "tra.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "e9ad7a1e": {
-      "filename": "trang.mp3",
+      "filename": "trang.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "58203356": {
-      "filename": "vang1.mp3",
+      "filename": "vang1.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "594fe4cd": {
-      "filename": "vang2.mp3",
+      "filename": "vang2.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "e7a68c01": {
-      "filename": "xanh_duong.mp3",
+      "filename": "xanh_duong.wav",
       "lesson_id": null,
       "vocab_id": null
     },
     "c5478423": {
-      "filename": "xanh_la.mp3",
+      "filename": "xanh_la.wav",
       "lesson_id": null,
       "vocab_id": null
     }
