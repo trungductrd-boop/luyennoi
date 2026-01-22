@@ -23,7 +23,7 @@ CHUNK_SIZE = 1024 * 1024  # 1MB
 import json
 import time
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, ProcessPoolExecutor
 from pathlib import Path as _Path
 import uuid as _uuid
 
@@ -32,7 +32,26 @@ import uuid as _uuid
 _default_workers = max(1, (os.cpu_count() or 1))
 _env_workers = int(os.environ.get("AUDIO_API_MAX_WORKERS", "2"))
 max_workers = 1 if getattr(helpers, 'FAST_MODE', False) else min(_env_workers, _default_workers)
+# Lightweight thread executor for small background tasks
 executor = ThreadPoolExecutor(max_workers=max_workers)
+# Lazy process pool for heavy CPU / native-extension work (librosa / numpy)
+_process_executor = None
+
+
+def _get_process_executor():
+	global _process_executor
+	if _process_executor is not None:
+		return _process_executor
+	try:
+		proc_workers = int(os.environ.get("AUDIO_API_MAX_PROC_WORKERS", "1"))
+	except Exception:
+		proc_workers = 1
+	try:
+		_process_executor = ProcessPoolExecutor(max_workers=max(1, proc_workers))
+	except Exception:
+		# fallback to thread executor if process pool cannot be created
+		_process_executor = executor
+	return _process_executor
 
 # In-memory task store (task_id -> meta)
 UPLOAD_TASKS: dict = {}
@@ -45,7 +64,7 @@ DEFAULT_UPLOAD_LIMIT = 10 * 1024 * 1024  # 10 MB
 SAMPLE_FEATURES: "OrderedDict[str, dict]" = OrderedDict()
 SAMPLE_FEATURES_LOCK = threading.Lock()
 # Max cached sample features entries (env override)
-SAMPLE_FEATURES_MAX = int(os.environ.get("SAMPLE_FEATURES_MAX", "200"))
+SAMPLE_FEATURES_MAX = int(os.environ.get("SAMPLE_FEATURES_MAX", "50"))
 
 # Lazy-load audio_id_map.json on first use to avoid loading large maps at import time
 AUDIO_ID_MAP_PATH = _Path("data/samples/audio_id_map.json")
@@ -55,6 +74,7 @@ def _ensure_audio_id_map():
 	global AUDIO_ID_MAP
 	if AUDIO_ID_MAP is not None:
 		return
+	# Try to load precomputed map file; if missing or empty, build a safe fallback
 	try:
 		if AUDIO_ID_MAP_PATH.exists():
 			AUDIO_ID_MAP = json.loads(AUDIO_ID_MAP_PATH.read_text(encoding="utf-8")) or {}
@@ -62,6 +82,37 @@ def _ensure_audio_id_map():
 			AUDIO_ID_MAP = {}
 	except Exception:
 		AUDIO_ID_MAP = {}
+	# If map is empty, attempt to populate from persisted store and built-in VOCAB
+	try:
+		if not AUDIO_ID_MAP:
+			AUDIO_ID_MAP = {}
+			# Load samples from persisted store (sample_id -> filename)
+			try:
+				helpers.load_persisted_store()
+				for sid, meta in helpers.PERSISTED_STORE.get("samples", {}).items():
+					fn = meta.get("filename")
+					if fn:
+						# map by sample id
+						AUDIO_ID_MAP.setdefault(sid, fn)
+						# also map by vocab_id if present
+						vid = meta.get("vocab_id")
+						if vid:
+							AUDIO_ID_MAP.setdefault(vid, fn)
+			except Exception:
+				pass
+			# Include built-in helpers.VOCAB entries (vocab_id -> audio filename)
+			try:
+				for lid, items in helpers.VOCAB.items():
+					for v in items:
+						vid = v.get("id")
+						fn = v.get("audio_filename")
+						if vid and fn:
+							AUDIO_ID_MAP.setdefault(vid, fn)
+			except Exception:
+				pass
+	except Exception:
+		# best-effort; leave AUDIO_ID_MAP as-is on failure
+		pass
 
 
 def save_upload_streaming(upload: UploadFile, tmp_dir: str, max_bytes: int):
@@ -108,7 +159,10 @@ def _extract_features_with_timeout(path: str, timeout: int = 30) -> Optional[dic
 	"""
 	if not path or not os.path.exists(path):
 		raise FileNotFoundError(path)
-	fut = executor.submit(helpers.extract_features, path)
+	# Offload heavy feature extraction into a separate process to keep the
+	# main process memory small (numpy/librosa loaded only in worker).
+	pool = _get_process_executor()
+	fut = pool.submit(helpers.extract_features, path)
 	return fut.result(timeout=timeout)
 
 
@@ -1696,9 +1750,9 @@ async def api_analyze_vocab(
 
 		# Validate vocab mapping if provided (use audio_id_map.json)
 		if vocab_id:
+			# Load audio id map for best-effort lookups but allow fallback
+			# to persisted store matching (samples/vocab links) below.
 			_ensure_audio_id_map()
-			if AUDIO_ID_MAP is None or vocab_id not in AUDIO_ID_MAP:
-				return JSONResponse(status_code=400, content={"error": "invalid_input", "detail": "vocab_id not found"})
 
 		os.makedirs(helpers.TMP_DIR, exist_ok=True)
 		created_tmp = True
