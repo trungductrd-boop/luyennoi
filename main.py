@@ -256,7 +256,7 @@ def safe_filename(name: Optional[str]) -> str:
     return base.replace("..", "")
 
 
-@app("startup")
+@app.on_event("startup")
 async def startup_event():
     """Initialize on startup"""
     # Load persisted store in all workers so in-memory data is available
