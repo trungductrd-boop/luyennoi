@@ -372,8 +372,12 @@ async def api_compare(
         # Quick defensive cast: ensure vocab_id is string to match JSON keys
         try:
             if vocab_id is not None:
-                # Print raw received vocab_id and type for debugging
-                helpers.logger.info("vocab_id raw (before strip): %r %s", vocab_id, type(vocab_id))
+                # Print raw received vocab_id for debugging (avoid calling built-in `type` name)
+                try:
+                    tname = vocab_id.__class__.__name__
+                except Exception:
+                    tname = None
+                helpers.logger.info("vocab_id raw (before strip): %r %s", vocab_id, tname)
                 vocab_id = str(vocab_id).strip()
                 helpers.logger.info("vocab_id normalized (after strip): %r", vocab_id)
         except Exception:
@@ -386,33 +390,43 @@ async def api_compare(
         except Exception:
             pass
 
-        helpers.logger.info("===== DEBUG =====")
-        helpers.logger.info("Received vocab_id: %s %s", vocab_id, type(vocab_id))
-        # Build a lightweight VOCAB_INDEX for quick debug (normalize keys by stripping)
-        VOCAB_INDEX = {}
+        # Only dump full VOCAB index when caller requested vocab-mode or an env flag is set.
+        # Avoid printing the entire VOCAB list on every audio upload to reduce log noise
         try:
-            for lid, items in helpers.VOCAB.items():
-                for v in items:
-                    vid = v.get("id")
-                    if vid is not None:
-                        VOCAB_INDEX[str(vid).strip()] = v
+            dump_vocab = (mode == "vocab") or (os.environ.get("DUMP_VOCAB_ON_COMPARE", "0") == "1")
         except Exception:
-            pass
-        try:
-            # include persisted lessons if already loaded
-            for lid, items in helpers.PERSISTED_STORE.get("lessons", {}).items():
-                for v in items:
-                    vid = v.get("id")
-                    if vid is not None:
-                        VOCAB_INDEX[str(vid).strip()] = v
-        except Exception:
-            pass
-        helpers.logger.info("VOCAB_INDEX keys sample: %s", list(VOCAB_INDEX.keys())[:20])
-        helpers.logger.info("VOCAB_INDEX size: %d", len(VOCAB_INDEX))
-        # Check existence
-        if vocab_id is not None and vocab_id not in VOCAB_INDEX:
-            helpers.logger.warning("NOT FOUND vocab_id %s", vocab_id)
-        helpers.logger.info("=================")
+            dump_vocab = False
+
+        if dump_vocab:
+            helpers.logger.info("===== DEBUG (vocab dump) =====")
+            try:
+                # Build a lightweight VOCAB_INDEX for quick debug (normalize keys by stripping)
+                VOCAB_INDEX = {}
+                try:
+                    for lid, items in helpers.VOCAB.items():
+                        for v in items:
+                            vid = v.get("id")
+                            if vid is not None:
+                                VOCAB_INDEX[str(vid).strip()] = v
+                except Exception:
+                    pass
+                try:
+                    # include persisted lessons if already loaded
+                    for lid, items in helpers.PERSISTED_STORE.get("lessons", {}).items():
+                        for v in items:
+                            vid = v.get("id")
+                            if vid is not None:
+                                VOCAB_INDEX[str(vid).strip()] = v
+                except Exception:
+                    pass
+                helpers.logger.info("VOCAB_INDEX keys sample: %s", list(VOCAB_INDEX.keys())[:20])
+                helpers.logger.info("VOCAB_INDEX size: %d", len(VOCAB_INDEX))
+                # Check existence
+                if vocab_id is not None and vocab_id not in VOCAB_INDEX:
+                    helpers.logger.warning("NOT FOUND vocab_id %s", vocab_id)
+            except Exception:
+                helpers.logger.exception("Failed during vocab dump")
+            helpers.logger.info("=================")
     except Exception:
         helpers.logger.exception("Debug logging failed")
     if not upload:
