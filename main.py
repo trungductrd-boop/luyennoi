@@ -86,12 +86,46 @@ async def log_raw_request_body(request: Request, call_next):
             is_binary_like = "multipart/form-data" in content_type or "application/octet-stream" in content_type
             if is_binary_like or len(body_bytes) > small_threshold:
                 try:
-                    helpers.logger.info("RAW REQUEST %s %s: [omitted %d bytes, content-type=%s]", request.method, request.url.path, len(body_bytes), content_type)
+                    # Attempt to extract small text form fields from the start of the multipart body
+                    # without logging the binary audio payload. Scan only the first N bytes.
+                    scan_bytes = int(os.environ.get('RAW_BODY_SCAN_BYTES', '8192'))
+                    head = body_bytes[:scan_bytes].decode('utf-8', errors='replace')
+                    import re
+                    fields = {}
+                    # Match patterns like: Content-Disposition: form-data; name="fieldname"\r\n\r\nvalue\r\n
+                    for m in re.finditer(r'Content-Disposition: form-data;\s*name="(?P<name>[^"]+)"(?:; filename="[^"]*")?\s*\r?\n(?:[^
+\n]*\r?\n)*\r?\n(?P<val>.*?)\r?\n(?=--)', head, flags=re.DOTALL | re.IGNORECASE):
+                        name = m.group('name')
+                        val = m.group('val')
+                        # Truncate long values and strip binary garbage
+                        if isinstance(val, str):
+                            val = val.strip()
+                            if len(val) > 200:
+                                val = val[:200] + '...'
+                        fields[name] = val
+                    if fields:
+                        try:
+                            helpers.logger.info("RAW REQUEST %s %s: multipart fields=%s (binary content omitted)", request.method, request.url.path, fields)
+                        except Exception:
+                            pass
+                        request._body = body_bytes
+                        request.state.raw_body = f"<multipart fields logged, {len(body_bytes)} bytes omitted>"
+                        request.state.form_fields = fields
+                    else:
+                        try:
+                            helpers.logger.info("RAW REQUEST %s %s: [omitted %d bytes, content-type=%s]", request.method, request.url.path, len(body_bytes), content_type)
+                        except Exception:
+                            pass
+                        # Preserve raw body for downstream handlers but store an omitted placeholder
+                        request._body = body_bytes
+                        request.state.raw_body = f"<{len(body_bytes)} bytes omitted, content-type={content_type}>"
                 except Exception:
-                    pass
-                # Preserve raw body for downstream handlers but store an omitted placeholder
-                request._body = body_bytes
-                request.state.raw_body = f"<{len(body_bytes)} bytes omitted, content-type={content_type}>"
+                    try:
+                        helpers.logger.info("RAW REQUEST %s %s: [omitted %d bytes, content-type=%s]", request.method, request.url.path, len(body_bytes), content_type)
+                    except Exception:
+                        pass
+                    request._body = body_bytes
+                    request.state.raw_body = f"<{len(body_bytes)} bytes omitted, content-type={content_type}>"
             else:
                 try:
                     body_text = body_bytes.decode('utf-8', errors='replace')
