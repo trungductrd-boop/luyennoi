@@ -1,13 +1,14 @@
 {
   "lessons": {
-    "1": {
-      "1_100": {
+    "1": [
+      {
+        "id": "1_1",
         "word": "Xin chào",
         "meaning": "Hello",
         "example": "Xin chào bạn!",
         "audio_filename": "xin_chao.wav"
       }
-    }
+    ]
   },
   "samples": {
     "3f63a43a": {"filename": "assets/samples/anh_trai.wav", "lesson_id": null, "vocab_id": null},
@@ -32,7 +33,7 @@
     "8eeedbfd": {"filename": "assets/samples/toi_khoe.wav", "lesson_id": null, "vocab_id": null},
     "f16405c5": {"filename": "assets/samples/vang1.wav", "lesson_id": null, "vocab_id": null},
     "00c76c94": {"filename": "assets/samples/vo.wav", "lesson_id": null, "vocab_id": null},
-    "0b5f1e23": {"filename": "assets/samples/xin_chao.wav", "lesson_id": "1", "vocab_id": "1_100"},
+    "0b5f1e23": {"filename": "assets/samples/xin_chao.wav", "lesson_id": "1", "vocab_id": "1_1"},
     "e1414db3": {"filename": "assets/samples/banh_mi.wav", "lesson_id": null, "vocab_id": null},
     "170c9a86": {"filename": "assets/samples/bo.wav", "lesson_id": null, "vocab_id": null},
     "bc55c859": {"filename": "assets/samples/ca.wav", "lesson_id": null, "vocab_id": null},

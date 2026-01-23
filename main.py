@@ -421,9 +421,28 @@ async def api_compare(
                     pass
                 helpers.logger.info("VOCAB_INDEX keys sample: %s", list(VOCAB_INDEX.keys())[:20])
                 helpers.logger.info("VOCAB_INDEX size: %d", len(VOCAB_INDEX))
-                # Check existence
-                if vocab_id is not None and vocab_id not in VOCAB_INDEX:
-                    helpers.logger.warning("NOT FOUND vocab_id %s", vocab_id)
+                # Permissive matching: allow short client IDs like 'w1' or '1' to match keys
+                # ending with `_N` (e.g., 'w1' -> match '1_1'). This avoids client-side
+                # mismatches while keeping canonical keys in the store.
+                try:
+                    if vocab_id is not None and vocab_id not in VOCAB_INDEX:
+                        import re
+                        m = re.search(r"(\d+)$", str(vocab_id))
+                        if m:
+                            num = m.group(1)
+                            candidates = [k for k in VOCAB_INDEX.keys() if k.endswith(f"_{num}")]
+                            if candidates:
+                                chosen = candidates[0]
+                                try:
+                                    helpers.logger.info("Permissive vocab match: %s -> %s", vocab_id, chosen)
+                                except Exception:
+                                    pass
+                                vocab_id = chosen
+                        # If still not found, warn as before
+                    if vocab_id is not None and vocab_id not in VOCAB_INDEX:
+                        helpers.logger.warning("NOT FOUND vocab_id %s", vocab_id)
+                except Exception:
+                    helpers.logger.exception("Error while attempting permissive vocab match")
             except Exception:
                 helpers.logger.exception("Failed during vocab dump")
             helpers.logger.info("=================")
@@ -444,7 +463,33 @@ async def api_compare(
     resolved_sample_id = None
     if mode == "vocab":
         allow_permissive = str(os.environ.get("ALLOW_PERMISSIVE_VOCAB", "0")) == "1"
+        # Ensure in-memory audio id map is populated before resolving
+        try:
+            # audio_api._ensure_audio_id_map populates AUDIO_ID_MAP from persisted store.
+            # Force a reload of the in-memory map in case the file was updated
+            # while the server process was running (helps during local edits).
+            try:
+                import audio_api as _audio_api
+                if hasattr(_audio_api, '_ensure_audio_id_map'):
+                    try:
+                        # Clear cached map to force re-read from disk
+                        setattr(_audio_api, 'AUDIO_ID_MAP', None)
+                    except Exception:
+                        pass
+                    _audio_api._ensure_audio_id_map()
+                    try:
+                        helpers.logger.info("AUDIO_ID_MAP reload keys sample: %s", list(getattr(_audio_api, 'AUDIO_ID_MAP', {}) .keys())[:20])
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+        except Exception:
+            pass
         sid, spath = resolve_vocab_sample(vocab_id, request_id=request_id)
+        try:
+            helpers.logger.info("resolve_vocab_sample returned: sid=%s spath=%s for vocab_id=%s", sid, spath, vocab_id)
+        except Exception:
+            pass
         if not sid or not spath:
             if allow_permissive:
                 try:
