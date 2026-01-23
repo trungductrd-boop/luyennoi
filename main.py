@@ -93,8 +93,7 @@ async def log_raw_request_body(request: Request, call_next):
                     import re
                     fields = {}
                     # Match patterns like: Content-Disposition: form-data; name="fieldname"\r\n\r\nvalue\r\n
-                    for m in re.finditer(r'Content-Disposition: form-data;\s*name="(?P<name>[^"]+)"(?:; filename="[^"]*")?\s*\r?\n(?:[^
-\n]*\r?\n)*\r?\n(?P<val>.*?)\r?\n(?=--)', head, flags=re.DOTALL | re.IGNORECASE):
+                    for m in re.finditer(r'Content-Disposition: form-data;\s*name="(?P<name>[^"]+)"(?:; filename="[^"]*")?\s*\r?\n(?:[^\n]*\r?\n)*\r?\n(?P<val>.*?)\r?\n(?=--)', head, flags=re.DOTALL | re.IGNORECASE):
                         name = m.group('name')
                         val = m.group('val')
                         # Truncate long values and strip binary garbage
@@ -257,7 +256,7 @@ def safe_filename(name: Optional[str]) -> str:
     return base.replace("..", "")
 
 
-@app.on_event("startup")
+@app("startup")
 async def startup_event():
     """Initialize on startup"""
     # Load persisted store in all workers so in-memory data is available
@@ -499,6 +498,17 @@ async def api_compare(
     if not upload:
         # Keep responses JSON-shaped for client compatibility
         return JSONResponse(status_code=400, content={"error": "no_user_file", "detail": "No user file provided", "request_id": request_id})
+
+    # Prefer form fields discovered by the middleware for multipart requests
+    try:
+        mf = getattr(request.state, 'form_fields', None)
+        if mf and mf.get('vocab_id'):
+            try:
+                helpers.logger.info("vocab_id (from multipart form_fields): %r", mf.get('vocab_id'))
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # Validate fields
     if type and type != "audio":
