@@ -79,17 +79,31 @@ async def log_raw_request_body(request: Request, call_next):
         # Only log for methods that typically have bodies
         if request.method in ("POST", "PUT", "PATCH"):
             body_bytes = await request.body()
-            try:
-                body_text = body_bytes.decode('utf-8', errors='replace')
-            except Exception:
-                body_text = str(body_bytes)
-            try:
-                helpers.logger.info("RAW REQUEST %s %s: %s", request.method, request.url.path, body_text)
-            except Exception:
-                pass
-            # Preserve raw body for downstream handlers
-            request._body = body_bytes
-            request.state.raw_body = body_text
+            content_type = (request.headers.get("content-type") or "").lower()
+            # Avoid printing raw multipart/binary payloads to logs (large and noisy).
+            # Only fully decode and log small text/json bodies.
+            small_threshold = int(os.environ.get("RAW_BODY_MAX_LOG_BYTES", "4096"))
+            is_binary_like = "multipart/form-data" in content_type or "application/octet-stream" in content_type
+            if is_binary_like or len(body_bytes) > small_threshold:
+                try:
+                    helpers.logger.info("RAW REQUEST %s %s: [omitted %d bytes, content-type=%s]", request.method, request.url.path, len(body_bytes), content_type)
+                except Exception:
+                    pass
+                # Preserve raw body for downstream handlers but store an omitted placeholder
+                request._body = body_bytes
+                request.state.raw_body = f"<{len(body_bytes)} bytes omitted, content-type={content_type}>"
+            else:
+                try:
+                    body_text = body_bytes.decode('utf-8', errors='replace')
+                except Exception:
+                    body_text = str(body_bytes)
+                try:
+                    helpers.logger.info("RAW REQUEST %s %s: %s", request.method, request.url.path, body_text)
+                except Exception:
+                    pass
+                # Preserve raw body for downstream handlers
+                request._body = body_bytes
+                request.state.raw_body = body_text
     except Exception:
         try:
             helpers.logger.exception("Failed to log raw request body")
